@@ -1,6 +1,6 @@
 # AppleSilicon-FP64
 
-Apple SiliconのMetalで、FP64形式の実数密行列積を計算するC++ライブラリーと実験用コマンドである。尾崎スキームIIの整数剰余による行列積を使い、値に依存する演算をすべてGPUで実行する。
+Apple SiliconのMetalで、FP64形式の実数密行列積を計算するライブラリーと実験用コマンドである。公開APIとコマンドはC、Metalの資源管理と実行指示はObjective-Cで実装する。C++からも同じCのヘッダーと関数を利用できる。尾崎スキームIIの整数剰余による行列積を使い、値に依存する演算をすべてGPUで実行する。
 
 ## 用語
 
@@ -54,9 +54,9 @@ GPUで使う演算を次の表に示す。
 
 ## 実行環境と資源
 
-Apple Silicon、macOS 26以降、Metal Shading Language 4をコンパイルできるXcode、CMakeが必要である。検証にはPython 3を使う。外部の数値計算ライブラリーは実装に必要ない。性能比較にはmacOSのAccelerateを使う。
+Apple Silicon、macOS 26以降、Metal Shading Language 4をコンパイルできるXcode、CMakeが必要である。CPU側の実装にはC11とObjective-CのARCを使う。GPUカーネルはMetal Shading Languageで記述する。検証にはPython 3とC++コンパイラーを使う。外部の数値計算ライブラリーは実装に必要ない。性能比較にはmacOSのAccelerateを使う。
 
-行列の各次元はMetalのテンソルが表現できる符号付き32ビット整数の範囲とする。作業領域は使用する法の数と行列の形状から確保する。デバイスのバッファー上限または利用可能なメモリーを超えた場合、理由を持つ例外を返す。資源不足やMetalの実行失敗をCPU計算へ置き換える処理は行わない。
+行列の各次元はMetalのテンソルが表現できる符号付き32ビット整数の範囲とする。作業領域は使用する法の数と行列の形状から確保する。失敗は戻り値で分類し、診断メッセージを返す。資源不足やMetalの実行失敗をCPU計算へ置き換える処理は行わない。
 
 ## ビルドと検証
 
@@ -74,7 +74,9 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-検証ではPython標準ライブラリーの`Fraction`と任意長整数を使う。入力の整数化、厳密な内積、FP64への最終丸めを独立に計算し、GPUの出力の全ビットと比較する。通常値の丸め、非正規化数、オーバーフロー、桁の打ち消し、INT32の内積の分割を検証する。同じインスタンスで、寸法、入力、整数幅を変えた積も検証する。
+検証ではPython標準ライブラリーの`Fraction`と任意長整数を使う。入力の整数化、厳密な内積、FP64への最終丸めを独立に計算し、GPUの出力の全ビットと比較する。通常値の丸め、非正規化数、オーバーフロー、桁の打ち消し、INT32の内積の分割を検証する。Cからは同じ計算器で寸法、入力、整数幅を変えた積と失敗時の診断を検証する。C++からもヘッダーを読み込み、ライブラリーをリンクして積を検証する。
+
+ライブラリーとコマンドだけをビルドする場合は、CMakeに`-DBUILD_TESTING=OFF`を指定する。この構成ではC++コンパイラーとPythonを使わない。
 
 ## コマンドの使用方法
 
@@ -96,19 +98,42 @@ ctest --test-dir build --output-on-failure
 
 ファイルの長さが寸法と一致しない場合や、NaNまたは無限大を含む場合、コマンドは理由を標準エラー出力へ書き、終了コード1で終了する。計算が正常に完了するまで、出力ファイルは開かない。
 
-コマンドのファイルの読み込みと有限値の検査はCPUで行う。C++ライブラリーでは、有限値の前提に従う入力を受け取り、行列の値をCPUで走査せずに計算する。
+コマンドのファイルの読み込みと有限値の検査はCPUで行う。ライブラリーでは、有限値の前提に従う入力を受け取り、行列の値をCPUで走査せずに計算する。
 
-## C++からの使用方法
+## CとC++からの使用方法
 
-公開する型と操作は`include/apple_fp64/matmul.hpp`で定義する。`multiplier_c`はMetalのパイプラインと作業領域を保持するため、複数の積について同じインスタンスを再利用できる。作業領域の容量が不足する場合だけ、より大きい領域を確保する。作業領域はインスタンスの破棄時に解放する。`multiply`の呼び出しが戻る時点でGPUの処理は完了している。
+公開する型、入出力の条件、所有権と失敗時の動作は`include/apple_fp64/matmul.h`で定義する。ヘッダーはC++で読み込む場合に`extern "C"`を適用する。ライブラリーを利用するためのC++のラッパーは必要ない。
 
-```cpp
-#include <apple_fp64/matmul.hpp>
+`apple_fp64_multiplier_t`はMetalのパイプラインと作業領域を保持するため、複数の積について同じ計算器を再利用できる。作業領域の容量が不足する場合だけ、より大きい領域を確保する。
 
-std::vector<double> a = {1, 2, 3, 4};
-std::vector<double> b = {5, 6, 7, 8};
-apple_fp64::multiplier_c multiplier("build/fp64.metallib");
-auto result = multiplier.multiply(a, b, 2, 2, 2);
+次の例はCとC++の両方でコンパイルできる。
+
+```c
+#include <apple_fp64/matmul.h>
+#include <stdio.h>
+
+int main(void)
+{
+    const double a[] = {1, 2, 3, 4};
+    const double b[] = {5, 6, 7, 8};
+    apple_fp64_multiplier_t *multiplier = NULL;
+    apple_fp64_result_t result = {0};
+    apple_fp64_error_t error = {0};
+    apple_fp64_status_t status = apple_fp64_multiplier_create("build/fp64.metallib", &multiplier, &error);
+    if (status == APPLE_FP64_SUCCESS) {
+        status = apple_fp64_multiply(multiplier, a, 4, b, 4, 2, 2, 2,
+                                     apple_fp64_default_options(), &result, &error);
+    }
+    if (status == APPLE_FP64_SUCCESS) {
+        printf("%g %g %g %g\n", result.values[0], result.values[1], result.values[2], result.values[3]);
+    } else {
+        fprintf(stderr, "%s\n", error.message != NULL ? error.message : "CPUのメモリーを確保できません。");
+    }
+    apple_fp64_result_destroy(&result);
+    apple_fp64_error_destroy(&error);
+    apple_fp64_multiplier_destroy(multiplier);
+    return status == APPLE_FP64_SUCCESS ? 0 : 1;
+}
 ```
 
 CMakeの`apple_fp64`ターゲットをリンクする。実行時には、ビルドで生成された`fp64.metallib`も配置する。
