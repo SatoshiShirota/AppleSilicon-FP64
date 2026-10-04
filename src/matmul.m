@@ -15,6 +15,7 @@
 /** @brief 計算器が保持するMetalバッファーの用途。 */
 typedef enum fp64_workspace_e {
     FP64_PLAN, /**< 入力の値に依存しない復元係数。 */
+    FP64_ANALYSIS, /**< GPUが求めた整数幅と非有限値の有無。 */
     FP64_INPUT_A, /**< AのFP64のビット列。 */
     FP64_INPUT_B, /**< BのFP64のビット列。 */
     FP64_SCALES_A, /**< Aの行の指数。 */
@@ -35,6 +36,8 @@ typedef enum fp64_workspace_e {
     id<MTLCommandQueue> queue; /**< 順序を保持する実行待ち行列。 */
     id<MTLComputePipelineState> row_scales; /**< 行の指数を求めるパイプライン。 */
     id<MTLComputePipelineState> column_scales; /**< 列の指数を求めるパイプライン。 */
+    id<MTLComputePipelineState> analysis; /**< 入力全体に必要な整数幅を求めるパイプライン。 */
+    id<MTLComputePipelineState> floating[2]; /**< FP64の積和演算。添字1は有限の入力だけを扱う。 */
     id<MTLComputePipelineState> residues; /**< 入力の余りを生成するパイプライン。 */
     id<MTLComputePipelineState> operands[2]; /**< AとBのStrassen法の入力を生成するパイプライン。 */
     id<MTLComputePipelineState> product[2]; /**< 一回の内積と、部分内積を蓄積する行列積のパイプライン。 */
@@ -95,18 +98,17 @@ static bool fp64_checked_size(size_t rows, size_t columns, size_t element_bytes,
 /**
  * @brief 使用する法と復元係数を、必要な数値範囲から決める。
  * @param[in] k 正の内積の項数。
- * @param[in] options 計算の整数幅。
+ * @param[in] precision_a Aの整数幅。
+ * @param[in] precision_b Bの整数幅。
  * @param[out] plan 入力の値に依存しない係数。
- * @param[out] error 診断の格納先。NULLを許容する。
- * @return 操作の成否。
+ * @return 必要な数値範囲を法の積で表せる場合はtrue。
  */
-static apple_fp64_status_t fp64_make_plan(uint32_t k, apple_fp64_options_t options,
-                                        fp64_crt_plan_t *plan, apple_fp64_error_t *error)
+static bool fp64_make_plan(uint32_t k, uint32_t precision_a, uint32_t precision_b,
+                           fp64_crt_plan_t *plan)
 {
-    const char *range_error = "整数幅と内積の長さに必要な範囲が、利用可能な法の積を超えます。";
-    uint64_t precision = (uint64_t)options.precision_a + options.precision_b;
+    uint64_t precision = (uint64_t)precision_a + precision_b;
     if (precision + fp64_word_bit_length(k) + 1 > FP64_MAX_LIMBS * FP64_DIGIT_BITS)
-        return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, range_error);
+        return false;
     fp64_big_uint_t bound = {0};
     for (fp64_word_t bit = 0; bit < 32; ++bit) {
         if ((k >> bit) & 1u) {
@@ -132,8 +134,7 @@ static apple_fp64_status_t fp64_make_plan(uint32_t k, apple_fp64_options_t optio
                                                | (carry << (FP64_DIGIT_BITS - 1));
                 carry = plan->product.digits[i] & 1u;
             }
-            fp64_word_t precision_limit = options.precision_a > options.precision_b
-                                        ? options.precision_a : options.precision_b;
+            fp64_word_t precision_limit = precision_a > precision_b ? precision_a : precision_b;
             for (fp64_word_t index = 0; index < plan->count; ++index) {
                 fp64_modulus_t modulus = plan->moduli[index];
                 fp64_big_uint_t basis = {0};
@@ -158,10 +159,10 @@ static apple_fp64_status_t fp64_make_plan(uint32_t k, apple_fp64_options_t optio
                     if (high >= modulus.value) high -= modulus.value;
                 }
             }
-            return APPLE_FP64_SUCCESS;
+            return true;
         }
     }
-    return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, range_error);
+    return false;
 }
 
 /**
@@ -238,14 +239,15 @@ static id<MTLCommandBuffer> fp64_command(AppleFP64Multiplier *backend, apple_fp6
 /**
  * @brief Metalの計算エンコーダーを作成する。
  * @param[in] command 未投入の指示。
+ * @param[in] dispatch_type 同じエンコーダーの処理を実行する順序。
  * @param[out] status 失敗時の分類。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 作成したエンコーダー。失敗時はnil。
  */
-static id<MTLComputeCommandEncoder> fp64_encoder(id<MTLCommandBuffer> command,
+static id<MTLComputeCommandEncoder> fp64_encoder(id<MTLCommandBuffer> command, MTLDispatchType dispatch_type,
                                                 apple_fp64_status_t *status, apple_fp64_error_t *error)
 {
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoderWithDispatchType:dispatch_type];
     if (encoder == nil) *status = fp64_fail(error, APPLE_FP64_METAL_ERROR, "Metalの計算エンコーダーを作成できません。");
     return encoder;
 }
@@ -268,7 +270,64 @@ static void fp64_dispatch_elements(id<MTLComputeCommandEncoder> encoder,
 }
 
 /**
- * @brief GPUの指数取得と余りの生成を記録する。
+ * @brief GPUの指数取得を記録する。
+ * @param[in] backend パイプラインと作業領域を所有する計算器。
+ * @param[in] encoder 入力解析をまとめるエンコーダー。
+ * @param[in] parameters 入力全体の寸法。
+ * @param[in] columns Bを処理する場合は1、Aの場合は0。
+ */
+static void fp64_encode_scales(AppleFP64Multiplier *backend, id<MTLComputeCommandEncoder> encoder,
+                               fp64_batch_parameters_t parameters, fp64_word_t columns)
+{
+    [encoder setComputePipelineState:columns ? backend->column_scales : backend->row_scales];
+    [encoder setBuffer:backend->workspace[columns ? FP64_INPUT_B : FP64_INPUT_A] offset:0 atIndex:0];
+    [encoder setBuffer:backend->workspace[columns ? FP64_SCALES_B : FP64_SCALES_A] offset:0 atIndex:1];
+    [encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
+    [encoder dispatchThreadgroups:MTLSizeMake(columns ? (parameters.columns + 31) / 32 : parameters.rows, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(columns ? 32 * FP64_COLUMN_SIMD_GROUPS : 32, 1, 1)];
+}
+
+/**
+ * @brief GPUで入力を解析し、計算方式を選ぶための情報を受け取る。
+ * @param[in] backend パイプラインと作業領域を所有する計算器。
+ * @param[in] parameters 入力全体の寸法。
+ * @param[in,out] measurement GPUの解析時間とCPUの待ち時間の加算先。
+ * @param[out] error 診断の格納先。NULLを許容する。
+ * @return 操作の成否。
+ */
+static apple_fp64_status_t fp64_analyse_inputs(AppleFP64Multiplier *backend,
+                                              fp64_batch_parameters_t parameters,
+                                              apple_fp64_measurement_t *measurement, apple_fp64_error_t *error)
+{
+    apple_fp64_status_t status = APPLE_FP64_SUCCESS;
+    id<MTLCommandBuffer> command = fp64_command(backend, &status, error);
+    if (command == nil) return status;
+    id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, MTLDispatchTypeConcurrent, &status, error);
+    if (encoder == nil) return status;
+    for (fp64_word_t columns = 0; columns < 2; ++columns)
+        fp64_encode_scales(backend, encoder, parameters, columns);
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [encoder setComputePipelineState:backend->analysis];
+    [encoder setBuffer:backend->workspace[FP64_SCALES_A] offset:0 atIndex:0];
+    [encoder setBuffer:backend->workspace[FP64_SCALES_B] offset:0 atIndex:1];
+    [encoder setBuffer:backend->workspace[FP64_ANALYSIS] offset:0 atIndex:2];
+    [encoder setBytes:&parameters length:sizeof(parameters) atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [encoder endEncoding];
+    [command commit];
+    double wait_start = fp64_monotonic_seconds();
+    [command waitUntilCompleted];
+    measurement->wait_seconds += fp64_monotonic_seconds() - wait_start;
+    if (command.status != MTLCommandBufferStatusCompleted)
+        return fp64_fail(error, APPLE_FP64_METAL_ERROR,
+                         [NSString stringWithFormat:@"Metalの入力解析に失敗しました: %@",
+                                                    command.error.localizedDescription].UTF8String);
+    measurement->prepare_seconds += command.GPUEndTime - command.GPUStartTime;
+    return APPLE_FP64_SUCCESS;
+}
+
+/**
+ * @brief GPUの余りの生成を記録する。
  * @param[in] backend パイプラインと作業領域を所有する計算器。
  * @param[in] command 未投入の指示。
  * @param[in] parameters 行列の寸法と整数幅。
@@ -285,16 +344,7 @@ static apple_fp64_status_t fp64_encode_prepare(AppleFP64Multiplier *backend, id<
     id<MTLBuffer> scales = backend->workspace[columns ? FP64_SCALES_B : FP64_SCALES_A];
     id<MTLBuffer> output = backend->workspace[parameters.strassen ? (columns ? FP64_OPERANDS_B : FP64_OPERANDS_A)
                                                                  : (columns ? FP64_RESIDUES_B : FP64_RESIDUES_A)];
-    id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, &status, error);
-    if (encoder == nil) return status;
-    [encoder setComputePipelineState:columns ? backend->column_scales : backend->row_scales];
-    [encoder setBuffer:input offset:0 atIndex:0];
-    [encoder setBuffer:scales offset:0 atIndex:1];
-    [encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
-    [encoder dispatchThreadgroups:MTLSizeMake(columns ? (parameters.columns + 31) / 32 : parameters.rows, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(columns ? 32 * FP64_COLUMN_SIMD_GROUPS : 32, 1, 1)];
-    [encoder endEncoding];
-    encoder = fp64_encoder(command, &status, error);
+    id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, MTLDispatchTypeSerial, &status, error);
     if (encoder == nil) return status;
     id<MTLComputePipelineState> pipeline = parameters.strassen ? backend->operands[columns] : backend->residues;
     [encoder setComputePipelineState:pipeline];
@@ -324,7 +374,7 @@ static apple_fp64_status_t fp64_encode_product(AppleFP64Multiplier *backend, id<
                                               apple_fp64_error_t *error)
 {
     apple_fp64_status_t status = APPLE_FP64_SUCCESS;
-    id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, &status, error);
+    id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, MTLDispatchTypeSerial, &status, error);
     if (encoder == nil) return status;
     bool strassen = parameters.strassen != 0;
     if (strassen) {
@@ -366,7 +416,7 @@ static apple_fp64_status_t fp64_encode_reconstruct(AppleFP64Multiplier *backend,
 {
     apple_fp64_status_t status = APPLE_FP64_SUCCESS;
     if (parameters.strassen) {
-        id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, &status, error);
+        id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, MTLDispatchTypeSerial, &status, error);
         if (encoder == nil) return status;
         [encoder setComputePipelineState:backend->combine];
         [encoder setBuffer:backend->workspace[FP64_RESIDUES_C] offset:0 atIndex:0];
@@ -377,7 +427,7 @@ static apple_fp64_status_t fp64_encode_reconstruct(AppleFP64Multiplier *backend,
                                (size_t)(parameters.rows / 2) * (parameters.columns / 2), 4);
         [encoder endEncoding];
     }
-    id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, &status, error);
+    id<MTLComputeCommandEncoder> encoder = fp64_encoder(command, MTLDispatchTypeSerial, &status, error);
     if (encoder == nil) return status;
     size_t index = 0;
     while (limbs > FP64_RECONSTRUCTION_CAPACITIES[index]) ++index;
@@ -396,7 +446,7 @@ static apple_fp64_status_t fp64_encode_reconstruct(AppleFP64Multiplier *backend,
 
 apple_fp64_options_t apple_fp64_default_options(void)
 {
-    return (apple_fp64_options_t){60, 60, 256};
+    return (apple_fp64_options_t){256};
 }
 
 apple_fp64_status_t apple_fp64_multiplier_create(const char *library_path,
@@ -427,6 +477,12 @@ apple_fp64_status_t apple_fp64_multiplier_create(const char *library_path,
         if (backend->row_scales == nil) return status;
         backend->column_scales = fp64_pipeline(backend, library, @"find_column_scales", &status, error);
         if (backend->column_scales == nil) return status;
+        backend->analysis = fp64_pipeline(backend, library, @"analyse_inputs", &status, error);
+        if (backend->analysis == nil) return status;
+        backend->floating[0] = fp64_pipeline(backend, library, @"floating_matmul_general", &status, error);
+        if (backend->floating[0] == nil) return status;
+        backend->floating[1] = fp64_pipeline(backend, library, @"floating_matmul_finite", &status, error);
+        if (backend->floating[1] == nil) return status;
         backend->residues = fp64_pipeline(backend, library, @"make_residues", &status, error);
         if (backend->residues == nil) return status;
         backend->operands[0] = fp64_pipeline(backend, library, @"strassen_operands_a", &status, error);
@@ -479,8 +535,8 @@ apple_fp64_status_t apple_fp64_multiply(apple_fp64_multiplier_t *multiplier,
             return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列の次元はMetalの符号付き32ビット整数の範囲で指定してください。");
         if (a_count != (size_t)m * k || b_count != (size_t)k * n)
             return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "入力配列の長さが行列の寸法と一致しません。");
-        if (options.precision_a == 0 || options.precision_b == 0 || options.batch_rows == 0)
-            return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "整数幅と行のまとまりの大きさは正の値で指定してください。");
+        if (options.batch_rows == 0)
+            return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行のまとまりの大きさは正の値で指定してください。");
         size_t output_bytes;
         if (!fp64_checked_size(m, n, sizeof(double), &output_bytes))
             return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列のサイズがsize_tの範囲を超えます。");
@@ -495,47 +551,64 @@ apple_fp64_status_t apple_fp64_multiply(apple_fp64_multiplier_t *multiplier,
         }
         AppleFP64Multiplier *backend = (__bridge AppleFP64Multiplier *)multiplier;
         apple_fp64_status_t status = APPLE_FP64_SUCCESS;
-        if (backend->plan_inner != k || backend->plan_precision_a != options.precision_a
-                                     || backend->plan_precision_b != options.precision_b) {
-            fp64_crt_plan_t coefficients;
-            status = fp64_make_plan(k, options, &coefficients, error);
+        apple_fp64_measurement_t measurement = {0};
+        size_t bytes[FP64_WORKSPACE_COUNT] = {0};
+        bytes[FP64_ANALYSIS] = sizeof(fp64_input_analysis_t);
+        if (!fp64_checked_size(m, k, sizeof(double), &bytes[FP64_INPUT_A])
+            || !fp64_checked_size(k, n, sizeof(double), &bytes[FP64_INPUT_B])
+            || !fp64_checked_size(m, 1, sizeof(fp64_scale_t), &bytes[FP64_SCALES_A])
+            || !fp64_checked_size(n, 1, sizeof(fp64_scale_t), &bytes[FP64_SCALES_B]))
+            return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列のサイズがsize_tの範囲を超えます。");
+        for (fp64_workspace_t kind = FP64_ANALYSIS; kind <= FP64_SCALES_B; ++kind) {
+            status = fp64_reserve_buffer(backend, kind, bytes[kind], &measurement, error);
             if (status != APPLE_FP64_SUCCESS) return status;
-            apple_fp64_measurement_t allocation_measurement = {0};
-            status = fp64_reserve_buffer(backend, FP64_PLAN, sizeof(coefficients), &allocation_measurement, error);
-            if (status != APPLE_FP64_SUCCESS) return status;
-            memcpy(backend->workspace[FP64_PLAN].contents, &coefficients, sizeof(coefficients));
-            backend->plan_inner = k;
-            backend->plan_precision_a = options.precision_a;
-            backend->plan_precision_b = options.precision_b;
         }
-        const fp64_crt_plan_t *plan = backend->workspace[FP64_PLAN].contents;
+        memcpy(backend->workspace[FP64_INPUT_A].contents, a, bytes[FP64_INPUT_A]);
+        memcpy(backend->workspace[FP64_INPUT_B].contents, b, bytes[FP64_INPUT_B]);
+        fp64_batch_parameters_t parameters = {m, n, k, 0, 1, 1, m, 0};
+        status = fp64_analyse_inputs(backend, parameters, &measurement, error);
+        if (status != APPLE_FP64_SUCCESS) return status;
+        const fp64_input_analysis_t *analysis = backend->workspace[FP64_ANALYSIS].contents;
+        parameters.precision_a = analysis->precision_a;
+        parameters.precision_b = analysis->precision_b;
+        bool modular = analysis->nonfinite == 0;
+        if (modular && (backend->plan_inner != k || backend->plan_precision_a != analysis->precision_a
+                                               || backend->plan_precision_b != analysis->precision_b)) {
+            fp64_crt_plan_t coefficients;
+            modular = fp64_make_plan(k, analysis->precision_a, analysis->precision_b, &coefficients);
+            if (modular) {
+                apple_fp64_measurement_t allocation_measurement = {0};
+                status = fp64_reserve_buffer(backend, FP64_PLAN, sizeof(coefficients), &allocation_measurement, error);
+                if (status != APPLE_FP64_SUCCESS) return status;
+                memcpy(backend->workspace[FP64_PLAN].contents, &coefficients, sizeof(coefficients));
+                backend->plan_inner = k;
+                backend->plan_precision_a = analysis->precision_a;
+                backend->plan_precision_b = analysis->precision_b;
+            }
+        }
+        const fp64_crt_plan_t *plan = modular ? backend->workspace[FP64_PLAN].contents : NULL;
+        measurement.modulus_count = modular ? plan->count : 0;
         uint32_t batch_rows = m < options.batch_rows ? m : options.batch_rows;
-        bool strassen = m >= 1024 && n >= 1024 && m % 2 == 0 && n % 128 == 0
+        bool strassen = modular && m >= 1024 && n >= 1024 && m % 2 == 0 && n % 128 == 0
                      && k % 2048 == 0 && batch_rows >= 128;
         if (strassen) batch_rows = (batch_rows / 2) * 2;
         uint32_t row_limit = strassen ? m / 2 : m;
         uint32_t row_step = strassen ? batch_rows / 2 : batch_rows;
-        size_t bytes[FP64_WORKSPACE_COUNT];
-        bytes[FP64_PLAN] = sizeof(*plan);
-        if (!fp64_checked_size(m, k, sizeof(double), &bytes[FP64_INPUT_A])
-            || !fp64_checked_size(k, n, sizeof(double), &bytes[FP64_INPUT_B])
-            || !fp64_checked_size(batch_rows, 1, sizeof(fp64_scale_t), &bytes[FP64_SCALES_A])
-            || !fp64_checked_size(n, 1, sizeof(fp64_scale_t), &bytes[FP64_SCALES_B])
-            || !fp64_checked_size(batch_rows, k, plan->count, &bytes[FP64_RESIDUES_A])
-            || !fp64_checked_size(k, n, plan->count, &bytes[FP64_RESIDUES_B])
-            || !fp64_checked_size(batch_rows, n, plan->count, &bytes[FP64_RESIDUES_C]))
-            return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列のサイズがsize_tの範囲を超えます。");
-        bytes[FP64_OPERANDS_A] = 0;
-        bytes[FP64_OPERANDS_B] = 0;
-        bytes[FP64_COMBINED_C] = strassen ? bytes[FP64_RESIDUES_C] : 0;
-        if (strassen) {
-            bytes[FP64_RESIDUES_A] = 0;
-            bytes[FP64_RESIDUES_B] = 0;
+        if (modular) {
+            bytes[FP64_PLAN] = sizeof(*plan);
+            if (!fp64_checked_size(batch_rows, n, plan->count, &bytes[FP64_RESIDUES_C]))
+                return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列のサイズがsize_tの範囲を超えます。");
+            if (strassen) {
+                bytes[FP64_COMBINED_C] = bytes[FP64_RESIDUES_C];
+                if (!fp64_checked_size(batch_rows / 2, k / 2, 7 * plan->count, &bytes[FP64_OPERANDS_A])
+                    || !fp64_checked_size(k / 2, n / 2, 7 * plan->count, &bytes[FP64_OPERANDS_B])
+                    || !fp64_checked_size(batch_rows / 2, n / 2, 7 * plan->count, &bytes[FP64_RESIDUES_C]))
+                    return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列のサイズがsize_tの範囲を超えます。");
+            } else if (!fp64_checked_size(batch_rows, k, plan->count, &bytes[FP64_RESIDUES_A])
+                       || !fp64_checked_size(k, n, plan->count, &bytes[FP64_RESIDUES_B])) {
+                return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列のサイズがsize_tの範囲を超えます。");
+            }
         }
-        if (strassen && (!fp64_checked_size(batch_rows / 2, k / 2, 7 * plan->count, &bytes[FP64_OPERANDS_A])
-                          || !fp64_checked_size(k / 2, n / 2, 7 * plan->count, &bytes[FP64_OPERANDS_B])
-                          || !fp64_checked_size(batch_rows / 2, n / 2, 7 * plan->count, &bytes[FP64_RESIDUES_C])))
-            return fp64_fail(error, APPLE_FP64_INVALID_ARGUMENT, "行列のサイズがsize_tの範囲を超えます。");
         size_t alignment = (size_t)getpagesize();
         if (output_bytes > (backend->device.maxBufferLength & ~(alignment - 1)))
             return fp64_fail(error, APPLE_FP64_METAL_ERROR, "出力がMetalデバイスのバッファー上限を超えます。");
@@ -551,7 +624,7 @@ apple_fp64_status_t apple_fp64_multiply(apple_fp64_multiplier_t *multiplier,
                 free(values);
                 return fp64_fail(error, APPLE_FP64_METAL_ERROR, "Metalの出力バッファーを作成できません。");
             }
-            size_t command_capacity = 1 + 3 * (((size_t)row_limit + row_step - 1) / row_step);
+            size_t command_capacity = modular ? 1 + 3 * (((size_t)row_limit + row_step - 1) / row_step) : 1;
             // ARCが参照を保持する要素をnilで初期化する。freeの前に各要素をnilへ戻して参照を解放する。
             id<MTLCommandBuffer> __strong *commands = (id<MTLCommandBuffer> __strong *)calloc(command_capacity, sizeof(*commands));
             if (commands == NULL) {
@@ -561,17 +634,31 @@ apple_fp64_status_t apple_fp64_multiply(apple_fp64_multiplier_t *multiplier,
             }
             size_t submitted = 0;
             id<MTLCommandBuffer> current = nil;
-            apple_fp64_measurement_t measurement = {0};
-            measurement.workspace_bytes = buffer_bytes;
-            measurement.modulus_count = plan->count;
+            measurement.workspace_bytes += buffer_bytes;
             for (fp64_workspace_t kind = FP64_PLAN; kind < FP64_WORKSPACE_COUNT; ++kind) {
-                if (bytes[kind] == 0) continue;
+                if (bytes[kind] == 0 || (kind >= FP64_ANALYSIS && kind <= FP64_SCALES_B)) continue;
                 status = fp64_reserve_buffer(backend, kind, bytes[kind], &measurement, error);
                 if (status != APPLE_FP64_SUCCESS) goto finish;
             }
-            memcpy(backend->workspace[FP64_INPUT_A].contents, a, bytes[FP64_INPUT_A]);
-            memcpy(backend->workspace[FP64_INPUT_B].contents, b, bytes[FP64_INPUT_B]);
-            fp64_batch_parameters_t parameters = {batch_rows, n, k, 0, options.precision_a, options.precision_b, m, strassen};
+            if (!modular) {
+                current = fp64_command(backend, &status, error);
+                if (current == nil) goto finish;
+                id<MTLComputeCommandEncoder> encoder = fp64_encoder(current, MTLDispatchTypeSerial, &status, error);
+                if (encoder == nil) goto finish;
+                [encoder setComputePipelineState:backend->floating[analysis->nonfinite == 0]];
+                [encoder setBuffer:backend->workspace[FP64_INPUT_A] offset:0 atIndex:0];
+                [encoder setBuffer:backend->workspace[FP64_INPUT_B] offset:0 atIndex:1];
+                [encoder setBuffer:output offset:0 atIndex:2];
+                [encoder setBytes:&parameters length:sizeof(parameters) atIndex:3];
+                [encoder dispatchThreadgroups:MTLSizeMake((n + 15) / 16, (m + 15) / 16, 1)
+                       threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                [encoder endEncoding];
+                commands[submitted++] = current;
+                [current commit];
+                goto finish;
+            }
+            parameters.rows = batch_rows;
+            parameters.strassen = strassen;
             current = fp64_command(backend, &status, error);
             if (current == nil) goto finish;
             status = fp64_encode_prepare(backend, current, parameters, 1, error);
@@ -607,7 +694,7 @@ apple_fp64_status_t apple_fp64_multiply(apple_fp64_multiplier_t *multiplier,
                 double wait_start = fp64_monotonic_seconds();
                 for (size_t index = submitted; index != 0; --index)
                     [commands[index - 1] waitUntilCompleted];
-                measurement.wait_seconds = fp64_monotonic_seconds() - wait_start;
+                measurement.wait_seconds += fp64_monotonic_seconds() - wait_start;
             }
             if (status == APPLE_FP64_SUCCESS) {
                 for (size_t index = 0; index < submitted; ++index) {
@@ -619,7 +706,8 @@ apple_fp64_status_t apple_fp64_multiply(apple_fp64_multiplier_t *multiplier,
                         break;
                     }
                     double seconds = command.GPUEndTime - command.GPUStartTime;
-                    if (index == 0 || (index - 1) % 3 == 0) measurement.prepare_seconds += seconds;
+                    if (!modular) measurement.product_seconds += seconds;
+                    else if (index == 0 || (index - 1) % 3 == 0) measurement.prepare_seconds += seconds;
                     else if ((index - 1) % 3 == 1) measurement.product_seconds += seconds;
                     else measurement.reconstruct_seconds += seconds;
                 }

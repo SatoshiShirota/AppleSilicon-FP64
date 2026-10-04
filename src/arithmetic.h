@@ -77,11 +77,19 @@ typedef struct fp64_bits_s {
     fp64_word_t high; /**< 符号と指数を含む上位32ビット。 */
 } fp64_bits_t;
 
-/** @brief 行または列の整数化に使う指数と、整数化した値の下位ビットの情報。 */
+/** @brief 行または列に含まれる有限値の指数と、非有限値の有無。 */
 typedef struct fp64_scale_s {
     int exponent; /**< 最大値を囲む2のべき乗の指数。 */
-    fp64_word_t trailing_zero_bits; /**< 整数化した全要素に共通する下位ゼロビット数の下限。8で打ち切る。 */
+    int lowest_exponent; /**< 非ゼロの最下位ビットの最小指数。非ゼロの有限値がない場合はINT_MAX。 */
+    fp64_word_t nonfinite; /**< NaNまたは無限大を含む場合は1。 */
 } fp64_scale_t;
+
+/** @brief GPUが求めた、損失のない整数化に必要な幅と非有限値の有無。 */
+typedef struct fp64_input_analysis_s {
+    fp64_word_t precision_a; /**< Aの各行を損失なく整数化できる幅の最大値。 */
+    fp64_word_t precision_b; /**< Bの各列を損失なく整数化できる幅の最大値。 */
+    fp64_word_t nonfinite; /**< いずれかの入力がNaNまたは無限大を含む場合は1。 */
+} fp64_input_analysis_t;
 
 /** @brief FP64_DIGIT_BITSの桁幅で表す、非負の固定長整数。 */
 #ifdef __METAL_VERSION__

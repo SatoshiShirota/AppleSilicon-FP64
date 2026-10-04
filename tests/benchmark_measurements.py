@@ -10,7 +10,7 @@ import sys
 def main() -> None:
     """二試行の出力を独立に集計し、表示された時間と速度比を照合する。"""
     output = subprocess.run(
-        [sys.argv[1], "benchmark", "128", "2", "60"],
+        [sys.argv[1], "benchmark", "128", "2"],
         check=True, capture_output=True, text=True, timeout=30,
     ).stdout
     names = ("Accelerate", "AppleSilicon-FP64")

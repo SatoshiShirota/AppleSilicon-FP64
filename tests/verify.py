@@ -1,4 +1,4 @@
-"""公開コマンドの数値結果を、整数と有理数による独立した計算で検証する。"""
+"""公開コマンドの数値結果を、有理数による独立した計算で検証する。"""
 
 import math
 import random
@@ -22,9 +22,8 @@ class Case:
         k: 内積の項数。
         a: 行優先の入力A。
         b: 行優先の入力B。
-        pa: Aの整数幅。
-        pb: Bの整数幅。
         batch: 一度に処理する行数。
+        fused: 広い指数範囲または非有限値を含み、各積和演算で丸める入力。
     """
 
     name: str
@@ -33,68 +32,72 @@ class Case:
     k: int
     a: list[float]
     b: list[float]
-    pa: int = 60
-    pb: int = 60
     batch: int = 256
+    fused: bool = False
 
 
-def scale_exponent(values):
-    """最大絶対値を囲む2のべき乗の指数を、整数から求める。
-
-    Args:
-        values: 一行または一列の有限値。
-
-    Returns:
-        最大値の指数。全要素がゼロの場合は0。
-    """
-    maximum = max((abs(Fraction(value)) for value in values), default=Fraction(0))
-    if maximum == 0:
-        return 0
-    # FP64の分母は2のべき乗なので、この差が最大値を囲む指数になる。
-    return maximum.numerator.bit_length() - (maximum.denominator.bit_length() - 1)
-
-
-def quantize(value, scale, precision):
-    """有理数から、ゼロ方向に切り捨てた整数を求める。
+def round_fraction(value):
+    """厳密な有理数をFP64へ最近接偶数丸めする。
 
     Args:
-        value: 有限の入力値。
-        scale: 最大値から求めた指数。
-        precision: 整数幅。
+        value: 丸める値。
 
     Returns:
-        定義に従って整数化した値。
+        丸めた値。表現範囲を超える場合は符号に従う無限大。
     """
-    number = Fraction(value)
-    exponent = precision - scale
-    number *= Fraction(2**exponent) if exponent >= 0 else Fraction(1, 2**-exponent)
-    return int(number)
+    try:
+        return float(value)
+    except OverflowError:
+        return -math.inf if value < 0 else math.inf
+
+
+def fused_result(a, b, c):
+    """浮動小数点の乗算を使わず、積和演算の期待値を求める。
+
+    Args:
+        a: 第一の乗数。
+        b: 第二の乗数。
+        c: 加数。
+
+    Returns:
+        厳密な積と加数の和を一回だけ丸めた値。
+    """
+    if any(math.isnan(value) for value in (a, b, c)):
+        return math.nan
+    negative = math.copysign(1, a) != math.copysign(1, b)
+    if math.isinf(a) or math.isinf(b):
+        if a == 0 or b == 0 or (math.isinf(c) and negative != (c < 0)):
+            return math.nan
+        return -math.inf if negative else math.inf
+    if math.isinf(c):
+        return c
+    exact = Fraction(a) * Fraction(b) + Fraction(c)
+    if exact == 0:
+        return -0.0 if (a == 0 or b == 0) and c == 0 and negative and math.copysign(1, c) < 0 else 0.0
+    return round_fraction(exact)
 
 
 def exact_result(case):
-    """CRTを使わず、厳密な整数の内積と最終丸めで期待値を求める。
+    """定義された内積の丸め方で、期待値の全ビットを求める。
 
     Args:
-        case: 検証する入力と整数幅。
+        case: 検証する入力。
 
     Returns:
         FP64の期待値のビット列。
     """
-    ha = [scale_exponent(case.a[i * case.k : (i + 1) * case.k]) for i in range(case.m)]
-    gb = [scale_exponent(case.b[j :: case.n]) for j in range(case.n)] if case.n else []
-    qa = [quantize(value, ha[index // case.k], case.pa) for index, value in enumerate(case.a)]
-    qb = [quantize(value, gb[index % case.n], case.pb) for index, value in enumerate(case.b)]
     output = bytearray()
     for i in range(case.m):
         for j in range(case.n):
-            integer = sum(qa[i * case.k + t] * qb[t * case.n + j] for t in range(case.k))
-            exponent = ha[i] + gb[j] - case.pa - case.pb
-            exact = Fraction(integer * 2**exponent) if exponent >= 0 else Fraction(integer, 2**-exponent)
-            try:
-                rounded = float(exact)
-            except OverflowError:
-                rounded = -math.inf if integer < 0 else math.inf
-            output.extend(struct.pack("<d", rounded))
+            if case.fused:
+                rounded = 0.0
+                for t in range(case.k):
+                    rounded = fused_result(case.a[i * case.k + t], case.b[t * case.n + j], rounded)
+            else:
+                exact = sum((Fraction(case.a[i * case.k + t]) * Fraction(case.b[t * case.n + j])
+                             for t in range(case.k)), Fraction(0))
+                rounded = round_fraction(exact)
+            output.extend(struct.pack("<Q", 0x7ff8000000000000) if math.isnan(rounded) else struct.pack("<d", rounded))
     return bytes(output)
 
 
@@ -113,38 +116,60 @@ def matrix_cases():
         Case("空の出力の行", 0, 3, 2, [], [1.0] * 6),
         Case("空の出力の列", 3, 0, 2, [1.0] * 6, []),
         Case("空の内積は正のゼロ", 2, 3, 0, [], []),
-        Case("保持する仮数が偶数の中間値", 1, 1, 2, [1.0, 2.0**-53], [1, 1], 54, 1),
-        Case("保持する仮数が奇数の中間値", 1, 1, 2, [math.nextafter(1, 2), 2.0**-53], [1, 1], 54, 1),
-        Case("中間値より下位の非ゼロの桁", 1, 1, 3, [1, 2.0**-53, 2.0**-100], [1, 1, 1], 101, 1),
-        Case("仮数の繰り上がり", 1, 1, 2, [math.nextafter(2, 1), 2.0**-53], [1, 1], 54, 1),
-        Case("最小の非正規化数", 1, 1, 1, [tiny], [1], 1, 1),
-        Case("最小の非正規化数の半分", 1, 1, 1, [minimum], [2.0**-53], 1, 1),
-        Case("負の値のゼロへの丸め", 1, 1, 1, [-minimum], [2.0**-53], 1, 1),
-        Case("非正規化数へ直接丸める", 1, 1, 2, [minimum, tiny], [2.0**-53, 2.0**-53], 53, 1),
-        Case("非正規化数から正規化数への境界", 1, 1, 2, [minimum, -tiny], [1, 0.5], 53, 2),
-        Case("最大の有限値", 1, 1, 1, [largest], [1], 53, 1),
-        Case("正負のオーバーフロー", 2, 1, 1, [largest, -largest], [2], 53, 1),
-        Case("打ち消しで残る項を整数化が捨てる", 1, 1, 3, [1, -1, 2.0**-80], [1, 1, 1], 60, 60),
-        Case("打ち消しで残る項を整数幅の増加で保持する", 1, 1, 3, [1, -1, 2.0**-80], [1, 1, 1], 81, 1),
-        Case("大きな積の厳密な打ち消し", 1, 1, 2, [largest, -largest], [2, 2], 53, 1),
-        Case("利用できる全法を使う整数幅", 1, 1, 1, [-math.pi], [math.e], 170, 170),
-        Case("INT32の内積を分割する長さ", 1, 1, 131073, [0.5] * 131073, [0.5] * 131073, 8, 8),
+        Case("保持する仮数が偶数の中間値", 1, 1, 2, [1.0, 2.0**-53], [1, 1]),
+        Case("保持する仮数が奇数の中間値", 1, 1, 2, [math.nextafter(1, 2), 2.0**-53], [1, 1]),
+        Case("中間値より下位の非ゼロの桁", 1, 1, 3, [1, 2.0**-53, 2.0**-100], [1, 1, 1]),
+        Case("仮数の繰り上がり", 1, 1, 2, [math.nextafter(2, 1), 2.0**-53], [1, 1]),
+        Case("最小の非正規化数", 1, 1, 1, [tiny], [1]),
+        Case("最小の非正規化数の半分", 1, 1, 1, [minimum], [2.0**-53]),
+        Case("負の値のゼロへの丸め", 1, 1, 1, [-minimum], [2.0**-53]),
+        Case("非正規化数へ直接丸める", 1, 1, 2, [minimum, tiny], [2.0**-53, 2.0**-53]),
+        Case("非正規化数から正規化数への境界", 1, 1, 2, [minimum, -tiny], [1, 0.5]),
+        Case("最大の有限値", 1, 1, 1, [largest], [1]),
+        Case("正負のオーバーフロー", 2, 1, 1, [largest, -largest], [2]),
+        Case("打ち消しで残る小さい項", 1, 1, 3, [1, -1, 2.0**-80], [1, 1, 1]),
+        Case("指数差が大きい乗数の積", 1, 1, 2, [1, 2.0**-80], [0, 2.0**80]),
+        Case("大きな積の厳密な打ち消し", 1, 1, 2, [largest, -largest], [2, 2]),
+        Case("CRTで表せる広い整数の積", 1, 1, 2, [1, 2.0**-168], [1, 2.0**-168]),
+        Case("CRTの範囲を超える整数の積", 1, 1, 2, [1, 2.0**-169], [1, 2.0**-169], fused=True),
+        Case("全有限範囲の小さい項を保持する", 1, 1, 2, [largest, tiny], [0, 1], fused=True),
+        Case("指数が逆向きの全有限範囲の積", 1, 1, 2, [largest, tiny], [tiny, largest], fused=True),
+        Case("積和演算は積を途中で丸めない", 1, 1, 3,
+             [largest, -1, 1 + 2.0**-27], [0, 1, 1 - 2.0**-27], fused=True),
+        Case("積和演算の中間値は偶数へ丸める", 3, 1, 3,
+             [largest, 1, 2.0**-53,
+              largest, math.nextafter(1, 2), 2.0**-53,
+              largest, math.nextafter(2, 1), 2.0**-53], [0, 1, 1], fused=True),
+        Case("積の範囲を超えた値を加数が打ち消す", 1, 1, 3,
+             [tiny, -largest, largest], [0, 1, 1.5], fused=True),
+        Case("積和演算の負のアンダーフロー", 1, 1, 2, [largest, -tiny], [0, 0.5], fused=True),
+        Case("積和演算の正規化数への繰り上がり", 1, 1, 3,
+             [largest, minimum, -tiny], [0, 1, 0.5], fused=True),
+        Case("NaNの静寂化と正規化", 2, 2, 1,
+             [struct.unpack("<d", struct.pack("<Q", 0xfff0000000000001))[0], 1], [1, math.nan], fused=True),
+        Case("正負の無限大とゼロの積", 2, 3, 1, [math.inf, -math.inf], [1, -1, -0.0], fused=True),
+        Case("反対符号の無限大の和", 1, 1, 2, [math.inf, -math.inf], [1, 1], fused=True),
+        Case("無限大の和と符号付きゼロ", 2, 2, 2, [math.inf, 1, -0.0, -0.0], [1, -0.0, 1, 0.0], fused=True),
+        Case("INT32の内積を分割する長さ", 1, 1, 131073, [0.5] * 131073, [0.5] * 131073),
     ]
     a = [0.5, -0.5, 0.5] * 64 + [0.5, -0.25, 0.5]
     b = [0.5] * 129 + [0.5] * 64 + [0.25] * 64 + [17 / 32 + 2.0**-40] + [0.5] * 129
-    cases.append(Case("下位ゼロビット数が異なる行と列の積", 65, 129, 3, a, b, 5, 5))
+    cases.append(Case("下位ゼロビット数が異なる行と列の積", 65, 129, 3, a, b))
     random_source = random.Random(17)
-    for name, m, n, k, pa, pb, batch, spread in [
-        ("タイルの端にある長方形", 35, 37, 33, 60, 60, 256, 3),
-        ("作業領域の再利用と端の行", 11, 7, 19, 60, 60, 3, 4),
-        ("二次元の入力の処理範囲", 2, 257, 257, 60, 60, 1, 2),
-        ("異なる整数幅", 5, 9, 13, 53, 80, 2, 15),
-        ("狭い整数幅による切り捨て", 4, 3, 7, 5, 7, 3, 9),
-        ("広い指数の分布", 3, 4, 8, 60, 60, 2, 1000),
+    for name, m, n, k, batch, spread, fused in [
+        ("タイルの端にある長方形", 35, 37, 33, 256, 3, False),
+        ("作業領域の再利用と端の行", 11, 7, 19, 3, 4, False),
+        ("二次元の入力の処理範囲", 2, 257, 257, 1, 2, False),
+        ("行と列で異なる指数の幅", 5, 9, 13, 2, 15, False),
+        ("広い指数の分布", 17, 19, 65, 2, 1000, True),
     ]:
         a = [math.ldexp(random_source.uniform(-1, 1), random_source.randint(-spread, spread)) for _ in range(m * k)]
         b = [math.ldexp(random_source.uniform(-1, 1), random_source.randint(-spread, spread)) for _ in range(k * n)]
-        cases.append(Case(name, m, n, k, a, b, pa, pb, batch))
+        cases.append(Case(name, m, n, k, a, b, batch, fused))
+    a = [1.0] * (17 * 33)
+    b = [1.0] * (33 * 19)
+    a[-1], b[-1] = tiny, largest
+    cases.append(Case("末尾の行と列を含む積和演算", 17, 19, 33, a, b, 1, True))
     return cases
 
 
@@ -160,7 +185,7 @@ def run_case(executable, directory, case):
     a_path.write_bytes(struct.pack(f"<{len(case.a)}d", *case.a))
     b_path.write_bytes(struct.pack(f"<{len(case.b)}d", *case.b))
     expected = exact_result(case)
-    command = [str(executable), "multiply", str(case.m), str(case.n), str(case.k), str(case.pa), str(case.pb), str(a_path), str(b_path), str(c_path), str(case.batch)]
+    command = [str(executable), "multiply", str(case.m), str(case.n), str(case.k), str(a_path), str(b_path), str(c_path), str(case.batch)]
     process = subprocess.run(command, capture_output=True, text=True, timeout=60)
     if process.returncode:
         raise AssertionError(f"{case.name}: {process.stderr}")
@@ -182,17 +207,14 @@ def rejected_inputs(executable, directory):
         directory: 一時ファイルの格納先。
     """
     a_path, b_path, c_path = (directory / name for name in ("a.bin", "b.bin", "c.bin"))
-    for name, a_bytes, precision, batch in [
-        ("行列ファイルの長さ", b"", 60, 256),
-        ("非有限のファイル入力", struct.pack("<d", math.nan), 60, 256),
-        ("法の積を超える整数幅", struct.pack("<d", 1), 171, 256),
-        ("ゼロの整数幅", struct.pack("<d", 1), 0, 256),
-        ("ゼロの行のまとまりの大きさ", struct.pack("<d", 1), 60, 0),
+    for name, a_bytes, batch in [
+        ("行列ファイルの長さ", b"", 256),
+        ("ゼロの行のまとまりの大きさ", struct.pack("<d", 1), 0),
     ]:
         a_path.write_bytes(a_bytes)
         b_path.write_bytes(struct.pack("<d", 1))
         c_path.unlink(missing_ok=True)
-        command = [str(executable), "multiply", "1", "1", "1", str(precision), str(precision), str(a_path), str(b_path), str(c_path), str(batch)]
+        command = [str(executable), "multiply", "1", "1", "1", str(a_path), str(b_path), str(c_path), str(batch)]
         process = subprocess.run(command, capture_output=True, text=True, timeout=60)
         if process.returncode == 0 or not process.stderr.strip() or c_path.exists():
             raise AssertionError(f"拒否できませんでした: {name}")

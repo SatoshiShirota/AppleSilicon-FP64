@@ -59,7 +59,7 @@ static bool fp64_matrix_bytes(uint32_t rows, uint32_t columns, size_t *bytes)
 }
 
 /**
- * @brief 有限のFP64値を、行優先のバイナリーファイルから読む。
+ * @brief FP64のビット列を、行優先のバイナリーファイルから読む。
  * @param[in] path 入力ファイル。
  * @param[in] rows 行数。
  * @param[in] columns 列数。
@@ -97,12 +97,6 @@ static bool fp64_read_matrix(const char *path, uint32_t rows, uint32_t columns,
     if (bytes != 0 && fread(data, 1, bytes, file) != bytes) {
         fprintf(stderr, "入力ファイルを読み込めません: %s\n", path);
         goto finish;
-    }
-    for (size_t index = 0; index < bytes / sizeof(double); ++index) {
-        if (!isfinite(data[index])) {
-            fprintf(stderr, "入力ファイルは有限のFP64値だけを含む必要があります: %s\n", path);
-            goto finish;
-        }
     }
     *values = data;
     *count = bytes / sizeof(double);
@@ -185,16 +179,15 @@ static bool fp64_create_multiplier(apple_fp64_multiplier_t **multiplier)
  */
 static int fp64_multiply_files(int argc, char **argv)
 {
-    if (argc != 10 && argc != 11) {
-        fprintf(stderr, "使い方: fp64_metal multiply M N K p_A p_B A.bin B.bin C.bin [行のまとまりの大きさ]\n");
+    if (argc != 8 && argc != 9) {
+        fprintf(stderr, "使い方: fp64_metal multiply M N K A.bin B.bin C.bin [行のまとまりの大きさ]\n");
         return 1;
     }
     uint32_t m, n, k;
     apple_fp64_options_t options = apple_fp64_default_options();
     if (!fp64_parse_number(argv[2], &m) || !fp64_parse_number(argv[3], &n)
-        || !fp64_parse_number(argv[4], &k) || !fp64_parse_number(argv[5], &options.precision_a)
-        || !fp64_parse_number(argv[6], &options.precision_b)
-        || (argc == 11 && !fp64_parse_number(argv[10], &options.batch_rows))) return 1;
+        || !fp64_parse_number(argv[4], &k)
+        || (argc == 9 && !fp64_parse_number(argv[8], &options.batch_rows))) return 1;
     size_t output_bytes;
     if (!fp64_matrix_bytes(m, n, &output_bytes)) return 1;
     double *a = NULL, *b = NULL;
@@ -203,8 +196,8 @@ static int fp64_multiply_files(int argc, char **argv)
     apple_fp64_result_t result = {0};
     apple_fp64_error_t error = {0};
     int exit_code = 1;
-    if (!fp64_read_matrix(argv[7], m, k, &a, &a_count)
-        || !fp64_read_matrix(argv[8], k, n, &b, &b_count)
+    if (!fp64_read_matrix(argv[5], m, k, &a, &a_count)
+        || !fp64_read_matrix(argv[6], k, n, &b, &b_count)
         || !fp64_create_multiplier(&multiplier)) goto finish;
     apple_fp64_status_t status = apple_fp64_multiply(multiplier, a, a_count, b, b_count,
                                                     m, n, k, options, &result, &error);
@@ -212,7 +205,7 @@ static int fp64_multiply_files(int argc, char **argv)
         fp64_print_error(&error);
         goto finish;
     }
-    FILE *file = fopen(argv[9], "wb");
+    FILE *file = fopen(argv[7], "wb");
     if (file == NULL) {
         fprintf(stderr, "出力ファイルを開けません。\n");
         goto finish;
@@ -376,16 +369,14 @@ static bool fp64_benchmark_interval(size_t method, uint32_t repetitions,
  */
 static int fp64_benchmark(int argc, char **argv)
 {
-    if (argc > 5) {
-        fprintf(stderr, "使い方: fp64_metal benchmark [行列の次数=512] [試行回数=5] [整数幅=60]\n");
+    if (argc > 4) {
+        fprintf(stderr, "使い方: fp64_metal benchmark [行列の次数=512] [試行回数=5]\n");
         return 1;
     }
     uint32_t n = 512, trials = 5;
     apple_fp64_options_t options = apple_fp64_default_options();
     if ((argc > 2 && !fp64_parse_number(argv[2], &n))
-        || (argc > 3 && !fp64_parse_number(argv[3], &trials))
-        || (argc > 4 && !fp64_parse_number(argv[4], &options.precision_a))) return 1;
-    options.precision_b = options.precision_a;
+        || (argc > 3 && !fp64_parse_number(argv[3], &trials))) return 1;
     if (n == 0 || trials == 0) {
         fprintf(stderr, "行列の次数と試行回数は正の値で指定してください。\n");
         return 1;
@@ -467,8 +458,8 @@ static int fp64_benchmark(int argc, char **argv)
     double maximum_error = 0;
     for (size_t index = 0; index < count; ++index)
         maximum_error = fmax(maximum_error, fabs(gpu.values[index] - reference[index]));
-    printf("デバイス: %s\n行列: %u × %u、整数幅: %u、試行回数: %u\nMetalの初期化: %g ms\n",
-           apple_fp64_device_name(multiplier), n, n, options.precision_a, trials, initialization * 1000);
+    printf("デバイス: %s\n行列: %u × %u、試行回数: %u\nMetalの初期化: %g ms\n",
+           apple_fp64_device_name(multiplier), n, n, trials, initialization * 1000);
     printf("準備実行: 各方式を累計%.3f秒以上、2区間以上。区間の目標時間: %.3f秒。\n",
            warmup_seconds, interval_seconds);
     for (size_t method = 0; method < 2; ++method)
@@ -501,7 +492,7 @@ static int fp64_benchmark(int argc, char **argv)
         printf("%s: %.6f ms (%.6f ～ %.6f ms)、%.3f GFLOP/s、絶対偏差の中央値 %.3f%%\n",
                current->name, total * 1000, current->total[0] * 1000, current->total[trials - 1] * 1000,
                2.0 * n * n * n / total / 1e9, deviation / total * 100);
-        if (current->latest.modulus_count != 0) {
+        if (method == 1) {
             printf("  入力変換 %.3f ms、GPUの行列積 %.3f ms、復元 %.3f ms、CPUの待ち時間 %.3f ms\n"
                    "  法 %u 個、Metalの作業領域 %.3f MiB\n",
                    fp64_median(current->prepare, trials) * 1000, fp64_median(current->product, trials) * 1000,
@@ -531,7 +522,7 @@ int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "multiply") == 0) return fp64_multiply_files(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "benchmark") == 0) return fp64_benchmark(argc, argv);
-    fprintf(stderr, "使い方: fp64_metal benchmark [次数] [試行回数] [整数幅]\n"
-                    "        fp64_metal multiply M N K p_A p_B A.bin B.bin C.bin [行のまとまりの大きさ]\n");
+    fprintf(stderr, "使い方: fp64_metal benchmark [次数] [試行回数]\n"
+                    "        fp64_metal multiply M N K A.bin B.bin C.bin [行のまとまりの大きさ]\n");
     return 1;
 }

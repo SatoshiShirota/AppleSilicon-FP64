@@ -16,22 +16,20 @@ typedef enum apple_fp64_status_e {
     APPLE_FP64_METAL_ERROR /**< Metalの資源の作成または実行に失敗した。 */
 } apple_fp64_status_t;
 
-/** @brief 計算の整数幅と、作業領域に保持する行数。 */
+/** @brief 作業領域に保持する行数。 */
 typedef struct apple_fp64_options_s {
-    uint32_t precision_a; /**< Aの整数幅。正の値で指定する。 */
-    uint32_t precision_b; /**< Bの整数幅。正の値で指定する。 */
-    uint32_t batch_rows; /**< 一度に処理する行数。正の値で指定する。 */
+    uint32_t batch_rows; /**< CRTの中間配列で一度に保持する行数。正の値で指定する。 */
 } apple_fp64_options_t;
 
 /** @brief 一回の積について取得した処理時間と資源量。 */
 typedef struct apple_fp64_measurement_s {
-    double prepare_seconds; /**< 入力変換に費やしたGPUの実行時間。 */
-    double product_seconds; /**< 余りの行列積に費やしたGPUの実行時間。 */
+    double prepare_seconds; /**< 入力の解析と変換に費やしたGPUの実行時間。 */
+    double product_seconds; /**< 行列積に費やしたGPUの実行時間。 */
     double reconstruct_seconds; /**< 復元に費やしたGPUの実行時間。 */
     double wait_seconds; /**< CPUがGPUの完了を待った実時間。 */
     double total_seconds; /**< 出力と作業領域の確保、転送、同期を含む実時間。 */
     size_t workspace_bytes; /**< 計算に使用したMetalバッファーの容量の合計。 */
-    uint32_t modulus_count; /**< 使用した法の個数。 */
+    uint32_t modulus_count; /**< 使用した法の個数。FP64の積和演算と空の積では0。 */
 } apple_fp64_measurement_t;
 
 /** @brief 呼び出し側が所有する出力と、その計算についての測定値。 */
@@ -52,7 +50,10 @@ typedef struct apple_fp64_error_s {
  */
 typedef struct apple_fp64_multiplier_s apple_fp64_multiplier_t;
 
-/** @brief 既定の整数幅と行のまとまりを返す。 @return 計算の設定。 */
+/**
+ * @brief 既定の行のまとまりを返す。
+ * @return 計算の設定。
+ */
 apple_fp64_options_t apple_fp64_default_options(void);
 
 /**
@@ -94,12 +95,12 @@ const char *apple_fp64_device_name(const apple_fp64_multiplier_t *multiplier);
  * @param[in] m Aと出力の行数。
  * @param[in] n Bと出力の列数。
  * @param[in] k 内積の項数。
- * @param[in] options 整数幅と行のまとまりの大きさ。
+ * @param[in] options 行のまとまりの大きさ。
  * @param[out] result 出力と測定値。失敗時は全フィールドがゼロとなる。
  * @param[out] error 失敗理由の格納先。診断が不要な場合はNULLを指定できる。
  * @return 操作の成否。
  * @pre multiplierとresultはNULLではないこと。multiplierはまだ破棄されていないこと。
- * @pre aとbは有限のFP64値だけを含むこと。要素数がゼロの場合だけNULLを指定できる。
+ * @pre aとbはFP64のビット列を保持すること。要素数がゼロの場合だけNULLを指定できる。
  * @pre resultとerrorは解放されていない出力やメッセージを所有していないこと。
  * @post 関数が戻る時点で、投入したGPUの処理は完了している。
  * @note 計算の数値的な意味はREADME.md「計算の定義」で定める。

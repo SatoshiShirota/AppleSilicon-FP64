@@ -23,7 +23,7 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/fp64.metallib
         -c ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels.metal -o ${CMAKE_CURRENT_BINARY_DIR}/fp64.air
     COMMAND ${XCRUN} -sdk macosx metallib ${CMAKE_CURRENT_BINARY_DIR}/fp64.air
         -o ${CMAKE_CURRENT_BINARY_DIR}/fp64.metallib
-    DEPENDS src/kernels.metal src/arithmetic.h
+    DEPENDS src/kernels.metal src/arithmetic.h src/fp64_fma.h
     VERBATIM)
 add_custom_target(fp64_shaders ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/fp64.metallib)
 
@@ -45,6 +45,11 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify.py $<TARGET_FILE:fp64_metal>)
     add_test(NAME benchmark_measurements COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_measurements.py $<TARGET_FILE:fp64_metal>)
+
+    add_executable(fused_multiply_add tests/fused_multiply_add.c)
+    target_include_directories(fused_multiply_add PRIVATE src)
+    target_compile_options(fused_multiply_add PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME fused_multiply_add COMMAND fused_multiply_add)
 
     add_executable(repeated_matrix_products tests/repeated_matrix_products.c)
     target_compile_options(repeated_matrix_products PRIVATE -Wall -Wextra -Wpedantic)

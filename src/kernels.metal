@@ -1,6 +1,7 @@
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include "arithmetic.h"
+#include "fp64_fma.h"
 
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -35,7 +36,7 @@ static inline int fp64_lowest_bit(fp64_bits_t bits) {
 /**
  * @brief Aの行に含まれる最大値の指数を求める。
  * @param[in] input FP64のビット列。
- * @param[out] scales 各行の指数と、整数化した値の下位ゼロビット数の下限。
+ * @param[out] scales 各行の最大値と最下位ビットの指数、非有限値の有無。
  * @param[in] parameters 行列の寸法。
  * @param[in] group 担当する行。
  * @param[in] lane SIMDグループ内のスレッド位置。
@@ -47,25 +48,29 @@ kernel void find_row_scales(device const fp64_bits_t* input [[buffer(0)]],
                         uint lane [[thread_index_in_simdgroup]]) {
     int maximum = FP64_ZERO_EXPONENT;
     int minimum = 2147483647;
+    uint nonfinite = 0;
     for (uint index = lane; index < parameters.inner; index += 32) {
         ulong offset = ulong(fp64_input_row(parameters, group)) * parameters.inner + index;
         fp64_bits_t bits = input[offset];
-        maximum = max(maximum, fp64_exponent(bits));
-        minimum = min(minimum, fp64_lowest_bit(bits));
+        if (((bits.high >> 20) & 2047u) == 2047u) nonfinite = 1;
+        else {
+            maximum = max(maximum, fp64_exponent(bits));
+            minimum = min(minimum, fp64_lowest_bit(bits));
+        }
     }
     maximum = simd_max(maximum);
     minimum = simd_min(minimum);
+    nonfinite = simd_max(nonfinite);
     if (lane == 0) {
         bool zero = maximum == FP64_ZERO_EXPONENT;
-        scales[group] = {zero ? 0 : maximum,
-                         zero ? 8u : uint(clamp(minimum + int(parameters.precision_a) - maximum, 0, 8))};
+        scales[group] = {zero ? 0 : maximum, minimum, nonfinite};
     }
 }
 
 /**
  * @brief Bの隣接する列を同時に読み、各列の最大値の指数を求める。
  * @param[in] input FP64のビット列。
- * @param[out] scales 各列の指数と、整数化した値の下位ゼロビット数の下限。
+ * @param[out] scales 各列の最大値と最下位ビットの指数、非有限値の有無。
  * @param[in] parameters 行列の寸法。
  * @param[in] group 担当する32列のまとまり。
  * @param[in] lane SIMDグループ内の列位置。
@@ -79,44 +84,90 @@ kernel void find_column_scales(device const fp64_bits_t* input [[buffer(0)]],
                                uint subgroup [[simdgroup_index_in_threadgroup]]) {
     threadgroup int maxima[FP64_COLUMN_SIMD_GROUPS][32];
     threadgroup int minima[FP64_COLUMN_SIMD_GROUPS][32];
+    threadgroup uint specials[FP64_COLUMN_SIMD_GROUPS][32];
     uint column = group * 32 + lane;
     int maximum = FP64_ZERO_EXPONENT;
     int minimum = 2147483647;
+    uint nonfinite = 0;
     if (column < parameters.columns) {
         for (uint row = subgroup; row < parameters.inner; row += FP64_COLUMN_SIMD_GROUPS) {
             fp64_bits_t bits = input[ulong(row) * parameters.columns + column];
-            maximum = max(maximum, fp64_exponent(bits));
-            minimum = min(minimum, fp64_lowest_bit(bits));
+            if (((bits.high >> 20) & 2047u) == 2047u) nonfinite = 1;
+            else {
+                maximum = max(maximum, fp64_exponent(bits));
+                minimum = min(minimum, fp64_lowest_bit(bits));
+            }
         }
     }
     maxima[subgroup][lane] = maximum;
     minima[subgroup][lane] = minimum;
+    specials[subgroup][lane] = nonfinite;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (subgroup == 0 && column < parameters.columns) {
         #pragma unroll
         for (uint index = 1; index < FP64_COLUMN_SIMD_GROUPS; ++index) {
             maximum = max(maximum, maxima[index][lane]);
             minimum = min(minimum, minima[index][lane]);
+            nonfinite |= specials[index][lane];
         }
         bool zero = maximum == FP64_ZERO_EXPONENT;
-        scales[column] = {zero ? 0 : maximum,
-                          zero ? 8u : uint(clamp(minimum + int(parameters.precision_b) - maximum, 0, 8))};
+        scales[column] = {zero ? 0 : maximum, minimum, nonfinite};
     }
 }
 
-/** @brief 整数化で残す仮数と、剰余の係数を参照する指数。 */
+/**
+ * @brief 入力を損失なく保持できる整数幅を行列全体について求める。
+ * @param[in] a Aの行ごとの解析結果。
+ * @param[in] b Bの列ごとの解析結果。
+ * @param[out] analysis 必要な整数幅と非有限値の有無。
+ * @param[in] parameters 行列全体の寸法。
+ * @param[in] lane SIMDグループ内の位置。
+ */
+kernel void analyse_inputs(device const fp64_scale_t* a [[buffer(0)]],
+                           device const fp64_scale_t* b [[buffer(1)]],
+                           device fp64_input_analysis_t* analysis [[buffer(2)]],
+                           constant fp64_batch_parameters_t& parameters [[buffer(3)]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint pa = 1, pb = 1, nonfinite = 0;
+    for (uint row = lane; row < parameters.rows; row += 32) {
+        pa = max(pa, uint(max(1, a[row].exponent - a[row].lowest_exponent)));
+        nonfinite |= a[row].nonfinite;
+    }
+    for (uint column = lane; column < parameters.columns; column += 32) {
+        pb = max(pb, uint(max(1, b[column].exponent - b[column].lowest_exponent)));
+        nonfinite |= b[column].nonfinite;
+    }
+    pa = simd_max(pa);
+    pb = simd_max(pb);
+    nonfinite = simd_max(nonfinite);
+    if (lane == 0) *analysis = {pa, pb, nonfinite};
+}
+
+/**
+ * @brief 整数化した値に共通する下位ゼロビット数の下限を求める。
+ * @param[in] scale 行または列の解析結果。
+ * @param[in] precision 整数化に使う幅。
+ * @return 8を上限とする下限。全要素がゼロの場合は8。
+ */
+static inline uint fp64_trailing_bits(fp64_scale_t scale, uint precision) {
+    return scale.lowest_exponent == 2147483647 ? 8u
+         : uint(clamp(scale.lowest_exponent + int(precision) - scale.exponent, 0, 8));
+}
+
+/** @brief 整数化で桁を揃えた仮数と、剰余の係数を参照する指数。 */
 struct fp64_quantized_input_s {
-    fp64_bits_t mantissa; /**< 切り捨てた仮数の絶対値。 */
+    fp64_bits_t mantissa; /**< 整数化に使う仮数の絶対値。 */
     uint shift; /**< 仮数に掛ける2のべき乗の指数。 */
     bool negative; /**< 入力の符号。 */
 };
 
 /**
- * @brief FP64の入力を、整数化で残す仮数と指数へ分解する。
+ * @brief FP64の入力を、損失のない整数化に使う仮数と指数へ分解する。
  * @param[in] bits 入力のビット列。
  * @param[in] precision 整数幅。
  * @param[in] scale 行または列の最大値の指数。
  * @return 法に依存しない整数化済みの仮数と指数。
+ * @pre 入力が有限で、precisionが行または列の全非ゼロビットを保持できること。
  */
 static inline fp64_quantized_input_s fp64_quantize(fp64_bits_t bits, uint precision, int scale) {
     uint raw_exponent = (bits.high >> 20) & 2047u;
@@ -156,6 +207,7 @@ kernel void make_residues(device const fp64_bits_t* input [[buffer(0)]],
     ulong input_index = column_mode ? index
                                    : ulong(fp64_input_row(parameters, scale_index)) * parameters.inner + index % parameters.inner;
     uint precision = column_mode ? parameters.precision_b : parameters.precision_a;
+    if (!column_mode) scale_index = fp64_input_row(parameters, scale_index);
     auto value = fp64_quantize(input[input_index], precision, scales[scale_index].exponent);
     for (uint t = 0; t < plan.count; ++t) {
         output[ulong(t) * count + index] = int8_t(fp64_signed_residue(value.mantissa, value.negative,
@@ -201,8 +253,8 @@ kernel void strassen_operands(device const fp64_bits_t* input [[buffer(0)]],
     uint row = uint(index / (width / 2)), column = uint(index % (width / 2));
     ulong offset = ulong(columns ? row : fp64_input_row(parameters, row)) * width + column;
     ulong lower = ulong(columns ? row + height / 2 : fp64_input_row(parameters, row + height / 2)) * width + column;
-    uint first_scale = columns ? column : row;
-    uint second_scale = columns ? column + width / 2 : row + height / 2;
+    uint first_scale = columns ? column : fp64_input_row(parameters, row);
+    uint second_scale = columns ? column + width / 2 : fp64_input_row(parameters, row + height / 2);
     uint precision = columns ? parameters.precision_b : parameters.precision_a;
     auto first_value = fp64_quantize(input[offset], precision, scales[first_scale].exponent);
     auto second_value = fp64_quantize(input[offset + width / 2], precision, scales[columns ? second_scale : first_scale].exponent);
@@ -270,17 +322,17 @@ kernel void residue_matmul(device int8_t* a [[buffer(0)]],
         for (uint index = lane; index < FP64_TILE_ROWS; index += 32) {
             uint input_row = row + index;
             if (input_row < parameters.rows) {
-                trailing_a = min(trailing_a, scales_a[input_row].trailing_zero_bits);
+                trailing_a = min(trailing_a, fp64_trailing_bits(scales_a[parameters.row_begin + input_row], parameters.precision_a));
                 if (parameters.strassen)
-                    trailing_a = min(trailing_a, scales_a[input_row + parameters.rows].trailing_zero_bits);
+                    trailing_a = min(trailing_a, fp64_trailing_bits(scales_a[parameters.row_begin + input_row + parameters.total_rows / 2], parameters.precision_a));
             }
         }
         for (uint index = lane; index < FP64_TILE_COLUMNS; index += 32) {
             uint input_column = column + index;
             if (input_column < parameters.columns) {
-                trailing_b = min(trailing_b, scales_b[input_column].trailing_zero_bits);
+                trailing_b = min(trailing_b, fp64_trailing_bits(scales_b[input_column], parameters.precision_b));
                 if (parameters.strassen)
-                    trailing_b = min(trailing_b, scales_b[input_column + parameters.columns].trailing_zero_bits);
+                    trailing_b = min(trailing_b, fp64_trailing_bits(scales_b[input_column + parameters.columns], parameters.precision_b));
             }
         }
         if (simd_min(trailing_a) + simd_min(trailing_b) >= 8) {
@@ -453,7 +505,7 @@ kernel void reconstruct(device const uchar* residues [[buffer(0)]],
         value = fp64_big_subtract(product, value, limb_count);
         negative = !negative;
     }
-    int scale = scales_a[index / parameters.columns].exponent + scales_b[index % parameters.columns].exponent
+    int scale = scales_a[fp64_input_row(parameters, uint(index / parameters.columns))].exponent + scales_b[index % parameters.columns].exponent
               - int(parameters.precision_a) - int(parameters.precision_b);
     ulong output_index = ulong(fp64_input_row(parameters, uint(index / parameters.columns))) * parameters.columns
                        + index % parameters.columns;
@@ -469,3 +521,44 @@ kernel void reconstruct(device const uchar* residues [[buffer(0)]],
     template [[host_name("reconstruct_" #name)]] kernel void reconstruct<size>(device const uchar*, device const fp64_scale_t*, device const fp64_scale_t*, device fp64_bits_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, uint2);
 FP64_RECONSTRUCTION_KERNELS(FP64_RECONSTRUCTION_KERNEL)
 #undef FP64_RECONSTRUCTION_KERNEL
+
+/**
+ * @brief タイルを共有し、FP64の積和で行列積を求める。
+ * @tparam finite_inputs 両入力が有限であることが確定している場合はtrue。
+ * @param[in] a Aのビット列。
+ * @param[in] b Bのビット列。
+ * @param[out] output FP64のビット列。
+ * @param[in] parameters 行列全体の寸法。
+ * @param[in] group 担当する列と行のタイル。
+ * @param[in] local タイル内の列と行。
+ */
+template <bool finite_inputs>
+kernel void floating_matmul(device const fp64_bits_t* a [[buffer(0)]],
+                            device const fp64_bits_t* b [[buffer(1)]],
+                            device fp64_bits_t* output [[buffer(2)]],
+                            constant fp64_batch_parameters_t& parameters [[buffer(3)]],
+                            uint2 group [[threadgroup_position_in_grid]],
+                            uint2 local [[thread_position_in_threadgroup]]) {
+    threadgroup fp64_bits_t tile_a[16 * 32], tile_b[32 * 16];
+    uint row = group.y * 16 + local.y, column = group.x * 16 + local.x;
+    uint thread_index = local.y * 16 + local.x;
+    fp64_bits_t sum = {0, 0};
+    for (uint begin = 0; begin < parameters.inner;) {
+        uint length = min(32u, parameters.inner - begin);
+        for (uint index = thread_index; index < 512; index += 256) {
+            uint ar = group.y * 16 + index / 32, ak = index % 32;
+            uint bk = index / 16, bc = group.x * 16 + index % 16;
+            tile_a[index] = ar < parameters.rows && ak < length ? a[ulong(ar) * parameters.inner + begin + ak] : fp64_bits_t{0, 0};
+            tile_b[index] = bc < parameters.columns && bk < length ? b[ulong(begin + bk) * parameters.columns + bc] : fp64_bits_t{0, 0};
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint index = 0; index < length; ++index)
+            sum = fp64_fused_multiply_add(tile_a[local.y * 32 + index], tile_b[index * 16 + local.x], sum, finite_inputs);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        begin += length;
+    }
+    if (row < parameters.rows && column < parameters.columns) output[ulong(row) * parameters.columns + column] = sum;
+}
+
+template [[host_name("floating_matmul_finite")]] kernel void floating_matmul<true>(device const fp64_bits_t*, device const fp64_bits_t*, device fp64_bits_t*, constant fp64_batch_parameters_t&, uint2, uint2);
+template [[host_name("floating_matmul_general")]] kernel void floating_matmul<false>(device const fp64_bits_t*, device const fp64_bits_t*, device fp64_bits_t*, constant fp64_batch_parameters_t&, uint2, uint2);
