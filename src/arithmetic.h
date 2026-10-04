@@ -77,10 +77,10 @@ typedef struct fp64_bits_s {
     fp64_word_t high; /**< 符号と指数を含む上位32ビット。 */
 } fp64_bits_t;
 
-/** @brief 行または列の整数化に使う指数と、法256の余りについての情報。 */
+/** @brief 行または列の整数化に使う指数と、整数化した値の下位ビットの情報。 */
 typedef struct fp64_scale_s {
     int exponent; /**< 最大値を囲む2のべき乗の指数。 */
-    fp64_word_t zero_mod_256; /**< 整数化した全要素の余りがゼロと確定した場合は1、それ以外は0。 */
+    fp64_word_t trailing_zero_bits; /**< 整数化した全要素に共通する下位ゼロビット数の下限。8で打ち切る。 */
 } fp64_scale_t;
 
 /** @brief FP64_DIGIT_BITSの桁幅で表す、非負の固定長整数。 */

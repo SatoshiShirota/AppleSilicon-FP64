@@ -53,6 +53,7 @@ static bool fp64_check_product(apple_fp64_multiplier_t *multiplier, uint32_t m, 
  * @param[in,out] multiplier 積を実行する計算器。
  * @return 全出力のビット列が一致した場合はtrue。
  * @note 行のまとまりに奇数を指定し、符号と指数が異なる行と列を含める。
+ * @note 上下と左右のブロックで、整数化した値の下位ゼロビット数を変える。
  */
 static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier)
 {
@@ -68,20 +69,30 @@ static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier)
     for (uint32_t inner = 0; inner < k; ++inner) {
         int first = (int)(inner % 11) - 5, second = (int)(inner % 13) - 6;
         inner_sum += first * second;
-        for (uint32_t row = 0; row < m; ++row)
-            a[(size_t)row * k + inner] = ((int)(row % 7) - 3) * first;
-        for (uint32_t column = 0; column < n; ++column)
-            b[(size_t)inner * n + column] = second * ((int)(column % 17) - 8);
+        for (uint32_t row = 0; row < m; ++row) {
+            int factor = (int)(row % 7) - 3;
+            if (row >= m / 2 && row < m / 2 + 128) factor += 8;
+            a[(size_t)row * k + inner] = factor * first;
+        }
+        for (uint32_t column = 0; column < n; ++column) {
+            int factor = (int)(column % 17) - 8;
+            if (column >= n / 2 && column < n / 2 + 64) factor += 16;
+            b[(size_t)inner * n + column] = second * factor;
+        }
     }
     apple_fp64_result_t result = {0};
     apple_fp64_error_t error = {0};
-    apple_fp64_options_t options = {60, 60, 255};
+    apple_fp64_options_t options = {9, 9, 255};
     apple_fp64_status_t status = apple_fp64_multiply(multiplier, a, a_count, b, b_count,
                                                     m, n, k, options, &result, &error);
     bool matches = status == APPLE_FP64_SUCCESS && result.count == (size_t)m * n;
     for (uint32_t row = 0; matches && row < m; ++row) {
+        int row_factor = (int)(row % 7) - 3;
+        if (row >= m / 2 && row < m / 2 + 128) row_factor += 8;
         for (uint32_t column = 0; matches && column < n; ++column) {
-            double expected = (double)(((int)(row % 7) - 3) * ((int)(column % 17) - 8) * inner_sum);
+            int column_factor = (int)(column % 17) - 8;
+            if (column >= n / 2 && column < n / 2 + 64) column_factor += 16;
+            double expected = (double)(row_factor * column_factor * inner_sum);
             matches = memcmp(&result.values[(size_t)row * n + column], &expected, sizeof(expected)) == 0;
         }
     }

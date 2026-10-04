@@ -318,6 +318,57 @@ typedef struct fp64_benchmark_series_s {
 } fp64_benchmark_series_t;
 
 /**
+ * @brief 同じ方式を連続して実行し、行列積一回当たりの時間を求める。
+ * @param[in] method Accelerateは0、AppleSilicon-FP64は1。
+ * @param[in] repetitions 区間内の反復回数。正の値。
+ * @param[in,out] multiplier GPUの計算器。
+ * @param[in] a n行n列の入力。
+ * @param[in] b n行n列の入力。
+ * @param[out] reference Accelerateの出力を保持するn行n列の配列。
+ * @param[in] n 行列の次数。
+ * @param[in] options GPUでの計算の設定。
+ * @param[out] measurement 各処理の平均時間と最後の反復の資源量。
+ * @param[out] error 実行に失敗した場合の診断。
+ * @return 全反復に成功した場合はtrue。
+ * @note 時間の範囲と反復の意味はREADME.md「コマンドの使用方法」で定める。
+ */
+static bool fp64_benchmark_interval(size_t method, uint32_t repetitions,
+                                     apple_fp64_multiplier_t *multiplier,
+                                     const double *a, const double *b, double *reference,
+                                     uint32_t n, apple_fp64_options_t options,
+                                     apple_fp64_measurement_t *measurement, apple_fp64_error_t *error)
+{
+    *measurement = (apple_fp64_measurement_t){0};
+    double start = fp64_monotonic_seconds();
+    if (method == 0) {
+        for (uint32_t iteration = 0; iteration < repetitions; ++iteration)
+            cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)n, (int)n, (int)n,
+                        1, a, (int)n, b, (int)n, 0, reference, (int)n);
+    } else {
+        size_t count = (size_t)n * n;
+        for (uint32_t iteration = 0; iteration < repetitions; ++iteration) {
+            apple_fp64_result_t result = {0};
+            apple_fp64_status_t status = apple_fp64_multiply(multiplier, a, count, b, count,
+                                                            n, n, n, options, &result, error);
+            if (status != APPLE_FP64_SUCCESS) return false;
+            measurement->prepare_seconds += result.measurement.prepare_seconds;
+            measurement->product_seconds += result.measurement.product_seconds;
+            measurement->reconstruct_seconds += result.measurement.reconstruct_seconds;
+            measurement->wait_seconds += result.measurement.wait_seconds;
+            measurement->workspace_bytes = result.measurement.workspace_bytes;
+            measurement->modulus_count = result.measurement.modulus_count;
+            apple_fp64_result_destroy(&result);
+        }
+    }
+    measurement->total_seconds = (fp64_monotonic_seconds() - start) / repetitions;
+    measurement->prepare_seconds /= repetitions;
+    measurement->product_seconds /= repetitions;
+    measurement->reconstruct_seconds /= repetitions;
+    measurement->wait_seconds /= repetitions;
+    return true;
+}
+
+/**
  * @brief AppleSilicon-FP64とAccelerateの性能を、同じ入力と試行回数で比較する。
  * @param[in] argc 引数の個数。
  * @param[in] argv コマンド引数。
@@ -342,7 +393,7 @@ static int fp64_benchmark(int argc, char **argv)
     size_t bytes;
     if (!fp64_matrix_bytes(n, n, &bytes)) return 1;
     double *a = malloc(bytes), *b = malloc(bytes), *reference = malloc(bytes);
-    double *samples = malloc((size_t)trials * 10 * sizeof(double));
+    double *samples = calloc((size_t)trials * 16, sizeof(double));
     apple_fp64_multiplier_t *multiplier = NULL;
     apple_fp64_result_t gpu = {0};
     apple_fp64_error_t error = {0};
@@ -369,53 +420,87 @@ static int fp64_benchmark(int argc, char **argv)
         series[method].reconstruct = series[method].product + trials;
         series[method].wait = series[method].reconstruct + trials;
     }
-    for (uint64_t iteration = 0; iteration <= trials; ++iteration) {
-        uint32_t trial = iteration != 0 ? (uint32_t)(iteration - 1) : 0;
-        for (size_t offset = 0; offset < 2; ++offset) {
-            size_t method = (trial + offset) % 2;
+    double *intervals = samples + (size_t)trials * 10;
+    double *ratios = intervals + (size_t)trials * 4;
+    double *deviations = ratios + trials;
+    const double warmup_seconds = 0.25; /**< 各方式に割り当てる準備実行の最小時間。 */
+    const double interval_seconds = 0.05; /**< 反復回数を決めるための区間の目標時間。 */
+    uint32_t repetitions[2] = {1, 1};
+    double warmed[2] = {0, 0};
+    for (size_t round = 0; round < 2 || warmed[0] < warmup_seconds || warmed[1] < warmup_seconds; ++round) {
+        for (size_t method = 0; method < 2; ++method) {
             apple_fp64_measurement_t measurement = {0};
-            if (method == 0) {
-                double start = fp64_monotonic_seconds();
-                cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)n, (int)n, (int)n,
-                            1, a, (int)n, b, (int)n, 0, reference, (int)n);
-                measurement.total_seconds = fp64_monotonic_seconds() - start;
-            } else {
-                apple_fp64_result_t result = {0};
-                apple_fp64_status_t status = apple_fp64_multiply(multiplier, a, count, b, count,
-                                                                n, n, n, options, &result, &error);
-                if (status != APPLE_FP64_SUCCESS) {
-                    fp64_print_error(&error);
-                    goto finish;
-                }
-                measurement = result.measurement;
-                apple_fp64_result_destroy(&gpu);
-                gpu = result;
+            if (!fp64_benchmark_interval(method, repetitions[method], multiplier, a, b, reference,
+                                          n, options, &measurement, &error)) {
+                fp64_print_error(&error);
+                goto finish;
             }
-            if (iteration != 0) {
-                fp64_benchmark_series_t *current = &series[method];
-                current->total[trial] = measurement.total_seconds;
-                current->prepare[trial] = measurement.prepare_seconds;
-                current->product[trial] = measurement.product_seconds;
-                current->reconstruct[trial] = measurement.reconstruct_seconds;
-                current->wait[trial] = measurement.wait_seconds;
-                current->latest = measurement;
-            }
+            warmed[method] += measurement.total_seconds * repetitions[method];
+            repetitions[method] = (uint32_t)fmin(UINT32_MAX, ceil(interval_seconds / measurement.total_seconds));
         }
+    }
+    for (uint32_t trial = 0; trial < trials; ++trial) {
+        for (size_t interval = 0; interval < 4; ++interval) {
+            size_t method = (trial + (interval == 1 || interval == 2)) % 2;
+            apple_fp64_measurement_t measurement = {0};
+            if (!fp64_benchmark_interval(method, repetitions[method], multiplier, a, b, reference,
+                                          n, options, &measurement, &error)) {
+                fp64_print_error(&error);
+                goto finish;
+            }
+            intervals[(size_t)trial * 4 + interval] = measurement.total_seconds;
+            fp64_benchmark_series_t *current = &series[method];
+            current->total[trial] += measurement.total_seconds / 2;
+            current->prepare[trial] += measurement.prepare_seconds / 2;
+            current->product[trial] += measurement.product_seconds / 2;
+            current->reconstruct[trial] += measurement.reconstruct_seconds / 2;
+            current->wait[trial] += measurement.wait_seconds / 2;
+            current->latest = measurement;
+        }
+        ratios[trial] = series[0].total[trial] / series[1].total[trial];
+    }
+    if (apple_fp64_multiply(multiplier, a, count, b, count, n, n, n, options, &gpu, &error)
+        != APPLE_FP64_SUCCESS) {
+        fp64_print_error(&error);
+        goto finish;
     }
     double maximum_error = 0;
     for (size_t index = 0; index < count; ++index)
         maximum_error = fmax(maximum_error, fabs(gpu.values[index] - reference[index]));
     printf("デバイス: %s\n行列: %u × %u、整数幅: %u、試行回数: %u\nMetalの初期化: %g ms\n",
            apple_fp64_device_name(multiplier), n, n, options.precision_a, trials, initialization * 1000);
-    printf("全試行でAとBの変換を含めています。方式ごとに一回の準備実行を除外しています。\n"
-           "全体の実時間の中央値、最小値、最大値を示します。\n");
-    double baseline = fp64_median(series[0].total, trials);
+    printf("準備実行: 各方式を累計%.3f秒以上、2区間以上。区間の目標時間: %.3f秒。\n",
+           warmup_seconds, interval_seconds);
+    for (size_t method = 0; method < 2; ++method)
+        printf("%sの準備実行: %.3f秒、一区間の反復回数: %u\n",
+               series[method].name, warmed[method], repetitions[method]);
+    printf("AppleSilicon-FP64の全反復でAとBの変換と戻り値の解放を含めています。\n"
+           "各区間の値は一回当たりの実時間です。実行した順に示します。\n");
+    for (uint32_t trial = 0; trial < trials; ++trial) {
+        printf("試行 %u:", trial + 1);
+        for (size_t interval = 0; interval < 4; ++interval) {
+            size_t method = (trial + (interval == 1 || interval == 2)) % 2;
+            printf(" %s %.6f ms%s", series[method].name,
+                   intervals[(size_t)trial * 4 + interval] * 1000, interval < 3 ? " →" : "");
+        }
+        printf("、速度比 %.6f\n", ratios[trial]);
+        printf("  入力変換 %.6f ms、GPUの行列積 %.6f ms、復元 %.6f ms、CPUの待ち時間 %.6f ms\n",
+               series[1].prepare[trial] * 1000, series[1].product[trial] * 1000,
+               series[1].reconstruct[trial] * 1000, series[1].wait[trial] * 1000);
+    }
+    double ratio = fp64_median(ratios, trials);
+    printf("同一試行の速度比（Accelerate / AppleSilicon-FP64）: %.6f (%.6f ～ %.6f)\n",
+           ratio, ratios[0], ratios[trials - 1]);
+    printf("全体の実時間の中央値、最小値、最大値と、中央値からの絶対偏差の中央値を示します。\n");
     for (size_t method = 0; method < 2; ++method) {
         fp64_benchmark_series_t *current = &series[method];
         double total = fp64_median(current->total, trials);
-        printf("%s: %.3f ms (%.3f ～ %.3f ms)、%.3f GFLOP/s、Accelerateとの速度比 %.3f\n",
+        for (uint32_t trial = 0; trial < trials; ++trial)
+            deviations[trial] = fabs(current->total[trial] - total);
+        double deviation = fp64_median(deviations, trials);
+        printf("%s: %.6f ms (%.6f ～ %.6f ms)、%.3f GFLOP/s、絶対偏差の中央値 %.3f%%\n",
                current->name, total * 1000, current->total[0] * 1000, current->total[trials - 1] * 1000,
-               2.0 * n * n * n / total / 1e9, baseline / total);
+               2.0 * n * n * n / total / 1e9, deviation / total * 100);
         if (current->latest.modulus_count != 0) {
             printf("  入力変換 %.3f ms、GPUの行列積 %.3f ms、復元 %.3f ms、CPUの待ち時間 %.3f ms\n"
                    "  法 %u 個、Metalの作業領域 %.3f MiB\n",

@@ -43,6 +43,8 @@ if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME exact_matrix_products COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/verify.py $<TARGET_FILE:fp64_metal>)
+    add_test(NAME benchmark_measurements COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_measurements.py $<TARGET_FILE:fp64_metal>)
 
     add_executable(repeated_matrix_products tests/repeated_matrix_products.c)
     target_compile_options(repeated_matrix_products PRIVATE -Wall -Wextra -Wpedantic)

@@ -35,7 +35,7 @@ static inline int fp64_lowest_bit(fp64_bits_t bits) {
 /**
  * @brief Aの行に含まれる最大値の指数を求める。
  * @param[in] input FP64のビット列。
- * @param[out] scales 各行の指数。
+ * @param[out] scales 各行の指数と、整数化した値の下位ゼロビット数の下限。
  * @param[in] parameters 行列の寸法。
  * @param[in] group 担当する行。
  * @param[in] lane SIMDグループ内のスレッド位置。
@@ -57,14 +57,15 @@ kernel void find_row_scales(device const fp64_bits_t* input [[buffer(0)]],
     minimum = simd_min(minimum);
     if (lane == 0) {
         bool zero = maximum == FP64_ZERO_EXPONENT;
-        scales[group] = {zero ? 0 : maximum, zero || minimum + int(parameters.precision_a) - maximum >= 8};
+        scales[group] = {zero ? 0 : maximum,
+                         zero ? 8u : uint(clamp(minimum + int(parameters.precision_a) - maximum, 0, 8))};
     }
 }
 
 /**
  * @brief Bの隣接する列を同時に読み、各列の最大値の指数を求める。
  * @param[in] input FP64のビット列。
- * @param[out] scales 各列の指数。
+ * @param[out] scales 各列の指数と、整数化した値の下位ゼロビット数の下限。
  * @param[in] parameters 行列の寸法。
  * @param[in] group 担当する32列のまとまり。
  * @param[in] lane SIMDグループ内の列位置。
@@ -98,7 +99,8 @@ kernel void find_column_scales(device const fp64_bits_t* input [[buffer(0)]],
             minimum = min(minimum, minima[index][lane]);
         }
         bool zero = maximum == FP64_ZERO_EXPONENT;
-        scales[column] = {zero ? 0 : maximum, zero || minimum + int(parameters.precision_b) - maximum >= 8};
+        scales[column] = {zero ? 0 : maximum,
+                          zero ? 8u : uint(clamp(minimum + int(parameters.precision_b) - maximum, 0, 8))};
     }
 }
 
@@ -244,8 +246,8 @@ template [[host_name("strassen_operands_b")]] kernel void strassen_operands<true
  * @param[out] output 法ごとに並ぶ、0以上の出力の余り。
  * @param[in] parameters 行列の寸法。
  * @param[in] plan 使用する法。
- * @param[in] scales_a Aの行の指数と、法256の余りの情報。
- * @param[in] scales_b Bの列の指数と、法256の余りの情報。
+ * @param[in] scales_a Aの行の指数と、整数化した値の下位ゼロビット数の下限。
+ * @param[in] scales_b Bの列の指数と、整数化した値の下位ゼロビット数の下限。
  * @param[in] group 列、行、法の順で表す担当タイル。
  * @param[in] lane SIMDグループ内のスレッド位置。
  * @param[in] thread_index スレッドグループ内の位置。
@@ -264,22 +266,24 @@ kernel void residue_matmul(device int8_t* a [[buffer(0)]],
     uint row = group.y * FP64_TILE_ROWS, column = group.x * FP64_TILE_COLUMNS;
     fp64_modulus_t modulus = plan.moduli[parameters.strassen ? group.z / 7 : group.z];
     if (modulus.value == 256) {
-        bool zero_a = true, zero_b = true;
+        uint trailing_a = 8, trailing_b = 8;
         for (uint index = lane; index < FP64_TILE_ROWS; index += 32) {
             uint input_row = row + index;
             if (input_row < parameters.rows) {
-                zero_a = zero_a && scales_a[input_row].zero_mod_256;
-                if (parameters.strassen) zero_a = zero_a && scales_a[input_row + parameters.rows].zero_mod_256;
+                trailing_a = min(trailing_a, scales_a[input_row].trailing_zero_bits);
+                if (parameters.strassen)
+                    trailing_a = min(trailing_a, scales_a[input_row + parameters.rows].trailing_zero_bits);
             }
         }
         for (uint index = lane; index < FP64_TILE_COLUMNS; index += 32) {
             uint input_column = column + index;
             if (input_column < parameters.columns) {
-                zero_b = zero_b && scales_b[input_column].zero_mod_256;
-                if (parameters.strassen) zero_b = zero_b && scales_b[input_column + parameters.columns].zero_mod_256;
+                trailing_b = min(trailing_b, scales_b[input_column].trailing_zero_bits);
+                if (parameters.strassen)
+                    trailing_b = min(trailing_b, scales_b[input_column + parameters.columns].trailing_zero_bits);
             }
         }
-        if (simd_all(zero_a) || simd_all(zero_b)) {
+        if (simd_min(trailing_a) + simd_min(trailing_b) >= 8) {
             for (uint index = thread_index; index < FP64_TILE_ROWS * FP64_TILE_COLUMNS; index += 32 * FP64_SIMD_GROUPS) {
                 uint output_row = row + index / FP64_TILE_COLUMNS;
                 uint output_column = column + index % FP64_TILE_COLUMNS;
