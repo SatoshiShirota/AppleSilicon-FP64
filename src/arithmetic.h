@@ -16,14 +16,14 @@ typedef uint32_t fp64_word_t; /**< 算術で使用する32ビット符号なし�
 #define FP64_CONSTANT static const /**< CPUでは各翻訳単位に定数を保持する。 */
 #endif
 
-#define FP64_DIGIT_BITS (24u) /**< 小整数との積が32ビットに収まる桁幅。 */
+#define FP64_DIGIT_BITS (18u) /**< CRT係数と余りの積の総和が32ビットに収まる桁幅。 */
 #define FP64_DIGIT_MASK ((1u << FP64_DIGIT_BITS) - 1u) /**< 一桁の値域を取り出すマスク。 */
-#define FP64_MAX_LIMBS (15u) /**< 全法の積の342ビットを格納する桁数。 */
+#define FP64_MAX_LIMBS (20u) /**< CRT係数の総和と法の積の倍数を格納する桁数。 */
 FP64_CONSTANT fp64_word_t FP64_CRT_MODULI[] = { /**< INT8で対称な余りを表せる互いに素な法。 */
-    256, 251, 241, 239, 233, 229, 227, 223, 211, 199, 197, 193, 191, 181,
-    179, 173, 167, 163, 157, 151, 149, 139, 137, 131, 127, 113, 109, 107,
-    103, 101, 97, 89, 83, 79, 73, 71, 67, 61, 59, 53, 47, 43, 41, 37,
-    31, 29, 23, 19, 17, 13, 11, 7, 5, 3
+    256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199,
+    197, 193, 191, 181, 179, 173, 167, 163, 157, 151, 149, 139, 137, 131,
+    127, 113, 109, 107, 103, 101, 97, 89, 83, 79, 73, 71, 67, 61, 59,
+    53, 47, 43, 41, 37, 29
 };
 #define FP64_MAX_MODULI (sizeof(FP64_CRT_MODULI) / sizeof(FP64_CRT_MODULI[0])) /**< 法の候補数。 */
 #define FP64_ZERO_EXPONENT (-2147483647) /**< 最大値の取得でゼロを除外する値。 */
@@ -32,6 +32,42 @@ FP64_CONSTANT fp64_word_t FP64_CRT_MODULI[] = { /**< INT8で対称な余りを�
 #define FP64_TILE_ROWS (64u) /**< 行列積のスレッドグループが担当する行数。 */
 #define FP64_TILE_COLUMNS (64u) /**< 行列積のスレッドグループが担当する列数。 */
 #define FP64_SIMD_GROUPS (4u) /**< 行列積を協調実行するSIMDグループ数。 */
+#define FP64_COLUMN_SIMD_GROUPS (4u) /**< 同じ列の指数取得を分担するSIMDグループ数。 */
+
+/**
+ * @brief CPUとGPUで共有する、復元カーネルの名前と整数の桁数。
+ * @param[in] apply 名前と桁数を受け取る宣言用のマクロ。
+ */
+#define FP64_RECONSTRUCTION_KERNELS(apply) \
+    apply(small, 4u) \
+    apply(medium, 8u) \
+    apply(large, 12u) \
+    apply(full, FP64_MAX_LIMBS)
+
+/**
+ * @brief 復元カーネルの配置から、整数の桁数を取り出す。
+ * @param[in] name カーネルの名前。
+ * @param[in] size 整数の桁数。
+ */
+#define FP64_RECONSTRUCTION_SIZE(name, size) size,
+FP64_CONSTANT fp64_word_t FP64_RECONSTRUCTION_CAPACITIES[] = { /**< 復元カーネルごとの整数の桁数。昇順で並ぶ。 */
+    FP64_RECONSTRUCTION_KERNELS(FP64_RECONSTRUCTION_SIZE)
+};
+#undef FP64_RECONSTRUCTION_SIZE
+#define FP64_RECONSTRUCTION_COUNT (sizeof(FP64_RECONSTRUCTION_CAPACITIES) / sizeof(FP64_RECONSTRUCTION_CAPACITIES[0])) /**< 復元カーネルの個数。 */
+
+#ifndef __METAL_VERSION__
+/**
+ * @brief 復元カーネルの配置から、Metalで使用する名前を取り出す。
+ * @param[in] name カーネルの名前。
+ * @param[in] size 整数の桁数。
+ */
+#define FP64_RECONSTRUCTION_NAME(name, size) "reconstruct_" #name,
+static const char *const FP64_RECONSTRUCTION_NAMES[] = { /**< Metalライブラリーから取得する復元カーネルの名前。 */
+    FP64_RECONSTRUCTION_KERNELS(FP64_RECONSTRUCTION_NAME)
+};
+#undef FP64_RECONSTRUCTION_NAME
+#endif
 
 #undef FP64_CONSTANT
 
@@ -41,10 +77,28 @@ typedef struct fp64_bits_s {
     fp64_word_t high; /**< 符号と指数を含む上位32ビット。 */
 } fp64_bits_t;
 
-/** @brief 基数2の24乗で表す、非負の固定長整数。 */
+/** @brief 行または列の整数化に使う指数と、法256の余りについての情報。 */
+typedef struct fp64_scale_s {
+    int exponent; /**< 最大値を囲む2のべき乗の指数。 */
+    fp64_word_t zero_mod_256; /**< 整数化した全要素の余りがゼロと確定した場合は1、それ以外は0。 */
+} fp64_scale_t;
+
+/** @brief FP64_DIGIT_BITSの桁幅で表す、非負の固定長整数。 */
+#ifdef __METAL_VERSION__
+template <unsigned limb_count>
+struct fp64_big_uint_s {
+    fp64_word_t digits[limb_count]; /**< 下位桁から並ぶ値。各桁はFP64_DIGIT_MASK以下。 */
+};
+typedef fp64_big_uint_s<FP64_MAX_LIMBS> fp64_big_uint_t; /**< CPUと同じ配置を持つ復元係数の整数。 */
+#define FP64_BIG_FUNCTION template <unsigned limb_count> /**< GPUでは配列の容量ごとに算術をコンパイルする。 */
+#define FP64_BIG_VALUE fp64_big_uint_s<limb_count> /**< GPUのスレッドが保持する整数。 */
+#else
 typedef struct fp64_big_uint_s {
     fp64_word_t digits[FP64_MAX_LIMBS]; /**< 下位桁から並ぶ値。各桁はFP64_DIGIT_MASK以下。 */
 } fp64_big_uint_t;
+#define FP64_BIG_FUNCTION /**< CPUでは復元係数の最大容量を使用する。 */
+#define FP64_BIG_VALUE fp64_big_uint_t /**< CPUが保持する整数。 */
+#endif
 
 #ifdef __METAL_VERSION__
 typedef thread fp64_big_uint_t *fp64_big_uint_output_t; /**< GPUのスレッドが更新する整数。 */
@@ -62,14 +116,13 @@ typedef struct fp64_modulus_s {
 /** @brief 入力の値に依存しないCRTの係数。 */
 typedef struct fp64_crt_plan_s {
     fp64_word_t count; /**< 使用する法の個数。 */
-    fp64_word_t limbs; /**< 使用する法の積を格納する桁数。 */
+    fp64_word_t limbs; /**< CRT係数の総和を格納する桁数。 */
     fp64_modulus_t moduli[FP64_MAX_MODULI]; /**< 使用順に並ぶ法と余りの計算に使う係数。 */
-    fp64_word_t inverses[FP64_MAX_MODULI]; /**< 各法に対する、それ以前の法の積の逆元。 */
-    fp64_word_t stage_limbs[FP64_MAX_MODULI]; /**< 各法を取り込んだ整数を保持するための桁数。 */
-    fp64_big_uint_t prefixes[FP64_MAX_MODULI]; /**< 各法より前に使用した法の積。 */
+    fp64_big_uint_t coefficients[FP64_MAX_MODULI]; /**< 各法に対応するCRT係数。 */
+    float ratios[FP64_MAX_MODULI]; /**< 各CRT係数を法の積で割った比。候補の選択にだけ使う。 */
     fp64_big_uint_t product; /**< 使用する法の積。 */
     fp64_big_uint_t half_product; /**< 使用する法の積の半分。 */
-    unsigned char powers[FP64_MAX_MODULI][FP64_MAX_LIMBS * FP64_DIGIT_BITS]; /**< 各法に対する2のべき乗の余り。指数の昇順で並ぶ。 */
+    unsigned short powers[FP64_MAX_MODULI][FP64_MAX_LIMBS * FP64_DIGIT_BITS]; /**< 下位8ビットは2のべき乗の余り、上位8ビットは32ビット高いべき乗の余り。 */
 } fp64_crt_plan_t;
 
 /** @brief 一つの行のまとまりをGPUに渡す寸法と整数幅。 */
@@ -80,6 +133,8 @@ typedef struct fp64_batch_parameters_s {
     fp64_word_t row_begin; /**< 入力Aにおける先頭行。 */
     fp64_word_t precision_a; /**< Aの整数幅。 */
     fp64_word_t precision_b; /**< Bの整数幅。 */
+    fp64_word_t total_rows; /**< 入力Aの行数。上下のブロックの対応に使う。 */
+    fp64_word_t strassen; /**< Strassen法でブロックを処理する場合は1、それ以外は0。 */
 } fp64_batch_parameters_t;
 
 /**
@@ -157,13 +212,15 @@ static inline fp64_word_t fp64_word_mod(fp64_word_t value, fp64_modulus_t modulu
  * @brief 二語の整数と2のべき乗の積を、対称な余りへ変換する。
  * @param[in] mantissa 整数化で残る仮数の絶対値。
  * @param[in] negative 入力の符号。
- * @param[in] power 2のべき乗をmodulusで割った余り。
+ * @param[in] powers 仮数の上位と下位に掛ける係数。fp64_crt_plan_tのpowersと同じ配置。
  * @param[in] modulus 256以下の法と、その法から求めた係数。
  * @return 符号付きINT8に収まる余り。
+ * @pre mantissaの上位は21ビット以下であること。
  */
-static inline int fp64_signed_residue(fp64_bits_t mantissa, bool negative, fp64_word_t power, fp64_modulus_t modulus) {
-    fp64_word_t remainder = fp64_word_mod(fp64_word_mod(mantissa.high, modulus) * modulus.word_weight + fp64_word_mod(mantissa.low, modulus), modulus);
-    remainder = fp64_word_mod(remainder * power, modulus);
+static inline int fp64_signed_residue(fp64_bits_t mantissa, bool negative, fp64_word_t powers, fp64_modulus_t modulus) {
+    // 仮数の上位は21ビット以下であるため、係数との積と下位の余りの和は32ビットに収まる。
+    fp64_word_t remainder = fp64_word_mod(mantissa.high * (powers >> 8)
+                                         + fp64_word_mod(mantissa.low, modulus) * (powers & 255u), modulus);
     if (negative && remainder != 0) remainder = modulus.value - remainder;
     return remainder >= (modulus.value + 1) / 2 ? (int)(remainder) - (int)(modulus.value) : (int)(remainder);
 }
@@ -175,7 +232,8 @@ static inline int fp64_signed_residue(fp64_bits_t mantissa, bool negative, fp64_
  * @param[in] limbs 有効な桁数。
  * @return 左辺が小さい場合は-1、等しい場合は0、大きい場合は1。
  */
-static inline int fp64_big_compare(fp64_big_uint_t left, fp64_big_uint_t right, fp64_word_t limbs) {
+FP64_BIG_FUNCTION
+static inline int fp64_big_compare(FP64_BIG_VALUE left, FP64_BIG_VALUE right, fp64_word_t limbs) {
     for (int i = (int)(limbs) - 1; i >= 0; --i) {
         if (left.digits[i] != right.digits[i]) return left.digits[i] < right.digits[i] ? -1 : 1;
     }
@@ -190,8 +248,9 @@ static inline int fp64_big_compare(fp64_big_uint_t left, fp64_big_uint_t right, 
  * @return leftからrightを引いた値。
  * @pre leftがright以上であること。
  */
-static inline fp64_big_uint_t fp64_big_subtract(fp64_big_uint_t left, fp64_big_uint_t right, fp64_word_t limbs) {
-    fp64_big_uint_t result = {0};
+FP64_BIG_FUNCTION
+static inline FP64_BIG_VALUE fp64_big_subtract(FP64_BIG_VALUE left, FP64_BIG_VALUE right, fp64_word_t limbs) {
+    FP64_BIG_VALUE result = {0};
     fp64_word_t borrow = 0;
     for (fp64_word_t i = 0; i < limbs; ++i) {
         fp64_word_t subtrahend = right.digits[i] + borrow;
@@ -234,27 +293,13 @@ static inline fp64_word_t fp64_big_mod(fp64_big_uint_t value, fp64_modulus_t mod
 }
 
 /**
- * @brief 一つの法の余りをCRTへ取り込む。
- * @param[in,out] value それ以前の法について復元済みの整数。取り込んだ法にも一致する整数へ更新する。
- * @param[in] prefix それ以前の法の積。
- * @param[in] modulus 取り込む法。
- * @param[in] inverse prefixの逆元。
- * @param[in] residue 0以上modulus.value未満の余り。
- * @param[in] limbs 有効な桁数。
- */
-static inline void fp64_crt_step(fp64_big_uint_output_t value, fp64_big_uint_t prefix, fp64_modulus_t modulus,
-                     fp64_word_t inverse, fp64_word_t residue, fp64_word_t limbs) {
-    fp64_word_t difference = fp64_word_mod(residue + modulus.value - fp64_big_mod(*value, modulus, limbs), modulus);
-    fp64_big_add_scaled(value, prefix, fp64_word_mod(difference * inverse, modulus), limbs);
-}
-
-/**
  * @brief 固定長整数が必要とするビット数を求める。
  * @param[in] value 非負整数。
  * @param[in] limbs 有効な桁数。
  * @return ゼロでは0。それ以外では最上位ビットの位置に1を加えた値。
  */
-static inline fp64_word_t fp64_big_bit_length(fp64_big_uint_t value, fp64_word_t limbs) {
+FP64_BIG_FUNCTION
+static inline fp64_word_t fp64_big_bit_length(FP64_BIG_VALUE value, fp64_word_t limbs) {
     for (int i = (int)(limbs) - 1; i >= 0; --i) {
         if (value.digits[i] != 0) return (fp64_word_t)(i) * FP64_DIGIT_BITS + fp64_word_bit_length(value.digits[i]);
     }
@@ -268,12 +313,14 @@ static inline fp64_word_t fp64_big_bit_length(fp64_big_uint_t value, fp64_word_t
  * @param[in] limbs 有効な桁数。
  * @return 範囲外をゼロとした32ビット。
  */
-static inline fp64_word_t fp64_big_window(fp64_big_uint_t value, fp64_word_t start, fp64_word_t limbs) {
+FP64_BIG_FUNCTION
+static inline fp64_word_t fp64_big_window(FP64_BIG_VALUE value, fp64_word_t start, fp64_word_t limbs) {
     fp64_word_t digit = start / FP64_DIGIT_BITS, offset = start % FP64_DIGIT_BITS;
     if (digit >= limbs) return 0;
     fp64_word_t result = value.digits[digit] >> offset;
-    if (digit + 1 < limbs) result |= value.digits[digit + 1] << (24 - offset);
-    if (offset > 16 && digit + 2 < limbs) result |= value.digits[digit + 2] << (48 - offset);
+    if (digit + 1 < limbs) result |= value.digits[digit + 1] << (FP64_DIGIT_BITS - offset);
+    if (offset > 2 * FP64_DIGIT_BITS - 32 && digit + 2 < limbs)
+        result |= value.digits[digit + 2] << (2 * FP64_DIGIT_BITS - offset);
     return result;
 }
 
@@ -284,7 +331,8 @@ static inline fp64_word_t fp64_big_window(fp64_big_uint_t value, fp64_word_t sta
  * @param[in] limbs 有効な桁数。
  * @return 範囲内に非ゼロのビットがあればtrue。
  */
-static inline bool fp64_big_any_below(fp64_big_uint_t value, fp64_word_t end, fp64_word_t limbs) {
+FP64_BIG_FUNCTION
+static inline bool fp64_big_any_below(FP64_BIG_VALUE value, fp64_word_t end, fp64_word_t limbs) {
     fp64_word_t whole = end / FP64_DIGIT_BITS, tail = end % FP64_DIGIT_BITS;
     for (fp64_word_t i = 0; i < limbs && i < whole; ++i) {
         if (value.digits[i] != 0) return true;
@@ -300,7 +348,8 @@ static inline bool fp64_big_any_below(fp64_big_uint_t value, fp64_word_t end, fp
  * @param[in] limbs 有効な桁数。
  * @return README.md「計算の定義」に従うFP64のビット列。
  */
-static inline fp64_bits_t fp64_pack_fp64(fp64_big_uint_t magnitude, bool negative, int scale, fp64_word_t limbs) {
+FP64_BIG_FUNCTION
+static inline fp64_bits_t fp64_pack_fp64(FP64_BIG_VALUE magnitude, bool negative, int scale, fp64_word_t limbs) {
     fp64_word_t length = fp64_big_bit_length(magnitude, limbs);
     if (length == 0) return (fp64_bits_t){0, 0};
     fp64_word_t sign = negative ? 0x80000000u : 0;
@@ -330,5 +379,8 @@ static inline fp64_bits_t fp64_pack_fp64(fp64_big_uint_t magnitude, bool negativ
     if (exponent > 1023) return (fp64_bits_t){0, sign | 0x7ff00000u};
     return (fp64_bits_t){mantissa.low, sign | ((fp64_word_t)(exponent + 1023) << 20) | (mantissa.high & 0xfffffu)};
 }
+
+#undef FP64_BIG_FUNCTION
+#undef FP64_BIG_VALUE
 
 #endif

@@ -49,6 +49,52 @@ static bool fp64_check_product(apple_fp64_multiplier_t *multiplier, uint32_t m, 
 }
 
 /**
+ * @brief 行と列の係数を持つ大きな長方形の積を、厳密な整数の期待値と比較する。
+ * @param[in,out] multiplier 積を実行する計算器。
+ * @return 全出力のビット列が一致した場合はtrue。
+ * @note 行のまとまりに奇数を指定し、符号と指数が異なる行と列を含める。
+ */
+static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier)
+{
+    const uint32_t m = 1026, n = 1152, k = 2048;
+    size_t a_count = (size_t)m * k, b_count = (size_t)k * n;
+    double *a = malloc(a_count * sizeof(double)), *b = malloc(b_count * sizeof(double));
+    if (a == NULL || b == NULL) {
+        free(a);
+        free(b);
+        return false;
+    }
+    int64_t inner_sum = 0;
+    for (uint32_t inner = 0; inner < k; ++inner) {
+        int first = (int)(inner % 11) - 5, second = (int)(inner % 13) - 6;
+        inner_sum += first * second;
+        for (uint32_t row = 0; row < m; ++row)
+            a[(size_t)row * k + inner] = ((int)(row % 7) - 3) * first;
+        for (uint32_t column = 0; column < n; ++column)
+            b[(size_t)inner * n + column] = second * ((int)(column % 17) - 8);
+    }
+    apple_fp64_result_t result = {0};
+    apple_fp64_error_t error = {0};
+    apple_fp64_options_t options = {60, 60, 255};
+    apple_fp64_status_t status = apple_fp64_multiply(multiplier, a, a_count, b, b_count,
+                                                    m, n, k, options, &result, &error);
+    bool matches = status == APPLE_FP64_SUCCESS && result.count == (size_t)m * n;
+    for (uint32_t row = 0; matches && row < m; ++row) {
+        for (uint32_t column = 0; matches && column < n; ++column) {
+            double expected = (double)(((int)(row % 7) - 3) * ((int)(column % 17) - 8) * inner_sum);
+            matches = memcmp(&result.values[(size_t)row * n + column], &expected, sizeof(expected)) == 0;
+        }
+    }
+    if (!matches) fprintf(stderr, "大きな長方形の積が整数の期待値と一致しません: %s\n",
+                          error.message != NULL ? error.message : "出力の長さまたは値が異なります。");
+    apple_fp64_result_destroy(&result);
+    apple_fp64_error_destroy(&error);
+    free(a);
+    free(b);
+    return matches;
+}
+
+/**
  * @brief 入力の長さが不正な場合、所有する出力を返さずに診断を返すことを検証する。
  * @param[in,out] multiplier 積を実行する計算器。
  * @return 定義された失敗を返した場合はtrue。
@@ -123,6 +169,8 @@ int main(int argc, char **argv)
                 && fp64_check_product(multiplier, 33, 65, 7, 2, -0.5, (apple_fp64_options_t){80, 54, 11})
                 && fp64_check_product(multiplier, 33, 65, 7, 0, 4, (apple_fp64_options_t){80, 54, 11})
                 && fp64_check_unreadable_library(argv[1])
+                && fp64_check_factored_product(multiplier)
+                && fp64_check_product(multiplier, 9, 3, 11, 2, -0.5, (apple_fp64_options_t){8, 9, 2})
                 && strcmp(device_name, apple_fp64_device_name(multiplier)) == 0;
     apple_fp64_multiplier_destroy(multiplier);
     if (!matches) fprintf(stderr, "公開APIの結果が一致しません。\n");
