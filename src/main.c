@@ -318,7 +318,7 @@ typedef struct fp64_benchmark_series_s {
 } fp64_benchmark_series_t;
 
 /**
- * @brief GPU完結版とAccelerateの性能を、同じ入力と試行回数で比較する。
+ * @brief AppleSilicon-FP64とAccelerateの性能を、同じ入力と試行回数で比較する。
  * @param[in] argc 引数の個数。
  * @param[in] argv コマンド引数。
  * @return 正常終了の場合は0、入力または実行の失敗では1。
@@ -361,7 +361,7 @@ static int fp64_benchmark(int argc, char **argv)
     double initialization_start = fp64_monotonic_seconds();
     if (!fp64_create_multiplier(&multiplier)) goto finish;
     double initialization = fp64_monotonic_seconds() - initialization_start;
-    fp64_benchmark_series_t series[2] = {{.name = "Accelerate"}, {.name = "GPU完結版"}};
+    fp64_benchmark_series_t series[2] = {{.name = "Accelerate"}, {.name = "AppleSilicon-FP64"}};
     for (size_t method = 0; method < 2; ++method) {
         series[method].total = samples + (size_t)trials * 5 * method;
         series[method].prepare = series[method].total + trials;
