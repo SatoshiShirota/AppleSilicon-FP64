@@ -12,50 +12,175 @@
 #include <string.h>
 #include <unistd.h>
 
-/** @brief 計算器が保持するMetalバッファーの用途。 */
+/**
+ * @~japanese
+ * @brief 計算器が保持するMetalバッファーの用途。
+ * @~english
+ * @brief Roles of the Metal buffers retained by the multiplier.
+ * @~
+ */
 typedef enum fp64_workspace_e {
-    FP64_PLAN, /**< 入力の値に依存しない復元係数。 */
-    FP64_ANALYSIS, /**< GPUが求めた整数幅と非有限値の有無。 */
-    FP64_INPUT_A, /**< AのFP64のビット列。 */
-    FP64_INPUT_B, /**< BのFP64のビット列。 */
-    FP64_SCALES_A, /**< Aの解析結果。調整量を求めるときは列、それ以外は行を扱う。 */
-    FP64_SCALES_B, /**< Bの解析結果。調整量を求めるときは行、それ以外は列を扱う。 */
-    FP64_INNER_SHIFTS, /**< 内積方向の指数の調整量。 */
-    FP64_RESIDUES_A, /**< Aの行のまとまりの余り。 */
-    FP64_RESIDUES_B, /**< Bの余り。 */
-    FP64_RESIDUES_C, /**< 出力の余り。 */
-    FP64_OPERANDS_A, /**< Strassen法で使うAのブロックの和と差。 */
-    FP64_OPERANDS_B, /**< Strassen法で使うBのブロックの和と差。 */
-    FP64_COMBINED_C, /**< Strassen法の七つの積から組み立てた出力の余り。 */
-    FP64_WORKSPACE_COUNT /**< 保持するバッファーの個数。 */
+    FP64_PLAN, /**< @~japanese 入力の値に依存しない復元係数。
+                * @~english Reconstruction coefficients independent of input values.
+                * @~
+                */
+    FP64_ANALYSIS, /**< @~japanese GPUが求めた整数幅と非有限値の有無。
+                    * @~english Integer widths and presence of nonfinite values determined by the GPU.
+                    * @~
+                    */
+    FP64_INPUT_A, /**< @~japanese AのFP64のビット列。
+                   * @~english FP64 bit patterns of A.
+                   * @~
+                   */
+    FP64_INPUT_B, /**< @~japanese BのFP64のビット列。
+                   * @~english FP64 bit patterns of B.
+                   * @~
+                   */
+    FP64_SCALES_A, /**< @~japanese Aの解析結果。調整量を求めるときは列、それ以外は行を扱う。
+                    * @~english Analysis of A. Covers columns when computing exponent adjustments, otherwise
+                    * rows.
+                    * @~
+                    */
+    FP64_SCALES_B, /**< @~japanese Bの解析結果。調整量を求めるときは行、それ以外は列を扱う。
+                    * @~english Analysis of B. Covers rows when computing exponent adjustments, otherwise
+                    * columns.
+                    * @~
+                    */
+    FP64_INNER_SHIFTS, /**< @~japanese 内積方向の指数の調整量。
+                        * @~english Exponent adjustments along the inner dimension.
+                        * @~
+                        */
+    FP64_RESIDUES_A, /**< @~japanese Aの行のまとまりの余り。
+                      * @~english Residues for a row batch of A.
+                      * @~
+                      */
+    FP64_RESIDUES_B, /**< @~japanese Bの余り。
+                      * @~english Residues of B.
+                      * @~
+                      */
+    FP64_RESIDUES_C, /**< @~japanese 出力の余り。
+                      * @~english Output residues.
+                      * @~
+                      */
+    FP64_OPERANDS_A, /**< @~japanese Strassen法で使うAのブロックの和と差。
+                      * @~english Sums and differences of A blocks used in Strassen multiplication.
+                      * @~
+                      */
+    FP64_OPERANDS_B, /**< @~japanese Strassen法で使うBのブロックの和と差。
+                      * @~english Sums and differences of B blocks used in Strassen multiplication.
+                      * @~
+                      */
+    FP64_COMBINED_C, /**< @~japanese Strassen法の七つの積から組み立てた出力の余り。
+                      * @~english Output residues assembled from the seven Strassen products.
+                      * @~
+                      */
+    FP64_WORKSPACE_COUNT /**< @~japanese 保持するバッファーの個数。
+                          * @~english Number of retained buffers.
+                          * @~
+                          */
 } fp64_workspace_t;
 
-/** @brief 計算器が所有するMetalの資源。 */
+/**
+ * @~japanese
+ * @brief 計算器が所有するMetalの資源。
+ * @~english
+ * @brief Metal resources owned by the multiplier.
+ * @~
+ */
 @interface AppleFP64Multiplier : NSObject {
 @public
-    id<MTLDevice> device; /**< 使用するデバイス。 */
-    id<MTLCommandQueue> queue; /**< 順序を保持する実行待ち行列。 */
-    id<MTLComputePipelineState> row_scales[2]; /**< 行の指数を求めるパイプライン。添字1は指数調整を使う。 */
-    id<MTLComputePipelineState> column_scales[2]; /**< 列の指数を求めるパイプライン。添字1は指数調整を使う。 */
-    id<MTLComputePipelineState> inner_shifts; /**< 内積方向の指数の調整量を求めるパイプライン。 */
-    id<MTLComputePipelineState> analysis; /**< 入力全体に必要な整数幅を求めるパイプライン。 */
-    id<MTLComputePipelineState> floating[2]; /**< FP64の積和演算。添字1は有限の入力だけを扱う。 */
-    id<MTLComputePipelineState> residues[2]; /**< 入力の余りを生成するパイプライン。添字1は指数調整を使う。 */
-    id<MTLComputePipelineState> operands[2][2]; /**< 指数調整の有無とAまたはBに対応する、Strassen法の入力の生成。 */
-    id<MTLComputePipelineState> product[2]; /**< 一回の内積と、部分内積を蓄積する行列積のパイプライン。 */
-    id<MTLComputePipelineState> combine; /**< 七つの積から出力を組み立てるパイプライン。 */
-    id<MTLComputePipelineState> reconstruct[FP64_RECONSTRUCTION_COUNT]; /**< 整数配列の容量ごとのCRTと丸めのパイプライン。 */
-    uint32_t plan_inner; /**< 復元係数を作成した内積の項数。係数の作成前は0。 */
-    uint32_t plan_precision_a; /**< 復元係数を作成したAの整数幅。 */
-    uint32_t plan_precision_b; /**< 復元係数を作成したBの整数幅。 */
-    char *device_name; /**< 計算器が所有するUTF-8のデバイス名。 */
-    id<MTLBuffer> workspace[FP64_WORKSPACE_COUNT]; /**< 用途ごとに再利用する作業領域。 */
+    id<MTLDevice> device; /**< @~japanese 使用するデバイス。
+                           * @~english Device in use.
+                           * @~
+                           */
+    id<MTLCommandQueue> queue; /**< @~japanese 順序を保持する実行待ち行列。
+                                * @~english Ordered command queue.
+                                * @~
+                                */
+    id<MTLComputePipelineState> row_scales[2]; /**< @~japanese 行の指数を求めるパイプライン。添字1は指数調整を使う。
+                                                * @~english Pipelines for row exponent analysis. Index 1 uses
+                                                * exponent adjustments.
+                                                * @~
+                                                */
+    id<MTLComputePipelineState> column_scales[2]; /**< @~japanese 列の指数を求めるパイプライン。添字1は指数調整を使う。
+                                                   * @~english Pipelines for column exponent analysis. Index 1
+                                                   * uses exponent adjustments.
+                                                   * @~
+                                                   */
+    id<MTLComputePipelineState> inner_shifts; /**< @~japanese 内積方向の指数の調整量を求めるパイプライン。
+                                               * @~english Pipeline for computing exponent adjustments along
+                                               * the inner dimension.
+                                               * @~
+                                               */
+    id<MTLComputePipelineState> analysis; /**< @~japanese 入力全体に必要な整数幅を求めるパイプライン。
+                                           * @~english Pipeline for determining the integer widths needed for
+                                           * the entire input.
+                                           * @~
+                                           */
+    id<MTLComputePipelineState> floating[2]; /**< @~japanese FP64の積和演算。添字1は有限の入力だけを扱う。
+                                              * @~english FP64 fused multiply-add. Index 1 handles only finite
+                                              * inputs.
+                                              * @~
+                                              */
+    id<MTLComputePipelineState> residues[2]; /**< @~japanese 入力の余りを生成するパイプライン。添字1は指数調整を使う。
+                                              * @~english Pipelines for generating input residues. Index 1
+                                              * uses exponent adjustments.
+                                              * @~
+                                              */
+    id<MTLComputePipelineState> operands[2][2]; /**< @~japanese 指数調整の有無とAまたはBに対応する、Strassen法の入力の生成。
+                                                 * @~english Strassen input generation for A or B, with or
+                                                 * without exponent adjustments.
+                                                 * @~
+                                                 */
+    id<MTLComputePipelineState> product[2]; /**< @~japanese 一回の内積と、部分内積を蓄積する行列積のパイプライン。
+                                             * @~english Matrix multiplication pipelines for a single dot
+                                             * product and for accumulating partial dot products.
+                                             * @~
+                                             */
+    id<MTLComputePipelineState> combine; /**< @~japanese 七つの積から出力を組み立てるパイプライン。
+                                          * @~english Pipeline for assembling the output from seven products.
+                                          * @~
+                                          */
+    id<MTLComputePipelineState> reconstruct[FP64_RECONSTRUCTION_COUNT]; /**< @~japanese 整数配列の容量ごとのCRTと丸めのパイプライン。
+                                                                         * @~english CRT and rounding pipelines for
+                                                                         * each integer array capacity.
+                                                                         * @~
+                                                                         */
+    uint32_t plan_inner; /**< @~japanese 復元係数を作成した内積の項数。係数の作成前は0。
+                          * @~english Dot product length used to construct the reconstruction coefficients.
+                          * Zero before construction.
+                          * @~
+                          */
+    uint32_t plan_precision_a; /**< @~japanese 復元係数を作成したAの整数幅。
+                                * @~english Integer width of A used to construct the reconstruction
+                                * coefficients.
+                                * @~
+                                */
+    uint32_t plan_precision_b; /**< @~japanese 復元係数を作成したBの整数幅。
+                                * @~english Integer width of B used to construct the reconstruction
+                                * coefficients.
+                                * @~
+                                */
+    char *device_name; /**< @~japanese 計算器が所有するUTF-8のデバイス名。
+                        * @~english UTF-8 device name owned by the multiplier.
+                        * @~
+                        */
+    id<MTLBuffer> workspace[FP64_WORKSPACE_COUNT]; /**< @~japanese 用途ごとに再利用する作業領域。
+                                                    * @~english Workspace reused for each buffer role.
+                                                    * @~
+                                                    */
 }
 @end
 
 @implementation AppleFP64Multiplier
 
-/** @brief ARCで管理されないデバイス名を解放する。 */
+/**
+ * @~japanese
+ * @brief ARCで管理されないデバイス名を解放する。
+ * @~english
+ * @brief Release the device name that is not managed by ARC.
+ * @~
+ */
 - (void)dealloc
 {
     free(device_name);
@@ -64,11 +189,19 @@ typedef enum fp64_workspace_e {
 @end
 
 /**
+ * @~japanese
  * @brief 診断メッセージを複写して、操作の失敗を返す。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @param[in] status 失敗の分類。
  * @param[in] message UTF-8の失敗理由。
  * @return status。メッセージの確保に失敗した場合はAPPLE_FP64_OUT_OF_MEMORY。
+ * @~english
+ * @brief Copy a diagnostic message and return an operation failure.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @param[in] status Failure status.
+ * @param[in] message UTF-8 failure message.
+ * @return status, or APPLE_FP64_OUT_OF_MEMORY if message allocation fails.
+ * @~
  */
 static apple_fp64_status_t fp64_fail(apple_fp64_error_t *error,
                                     apple_fp64_status_t status, const char *message)
@@ -81,12 +214,21 @@ static apple_fp64_status_t fp64_fail(apple_fp64_error_t *error,
 }
 
 /**
+ * @~japanese
  * @brief 行列の容量を、size_tの範囲内で求める。
  * @param[in] rows 行数。
  * @param[in] columns 列数。
  * @param[in] element_bytes 一要素に必要なバイト数。
  * @param[out] bytes 容量。
  * @return 積を表現できる場合はtrue。
+ * @~english
+ * @brief Compute the matrix allocation size within the range of size_t.
+ * @param[in] rows Number of rows.
+ * @param[in] columns Number of columns.
+ * @param[in] element_bytes Number of bytes per element.
+ * @param[out] bytes Allocation size.
+ * @return true if the product is representable.
+ * @~
  */
 static bool fp64_checked_size(size_t rows, size_t columns, size_t element_bytes, size_t *bytes)
 {
@@ -98,12 +240,21 @@ static bool fp64_checked_size(size_t rows, size_t columns, size_t element_bytes,
 }
 
 /**
+ * @~japanese
  * @brief 使用する法と復元係数を、必要な数値範囲から決める。
  * @param[in] k 正の内積の項数。
  * @param[in] precision_a Aの整数幅。
  * @param[in] precision_b Bの整数幅。
  * @param[out] plan 入力の値に依存しない係数。
  * @return 必要な数値範囲を法の積で表せる場合はtrue。
+ * @~english
+ * @brief Choose the moduli and reconstruction coefficients from the required numerical range.
+ * @param[in] k Positive number of terms in each dot product.
+ * @param[in] precision_a Integer width of A.
+ * @param[in] precision_b Integer width of B.
+ * @param[out] plan Coefficients independent of input values.
+ * @return true if the modulus product can represent the required numerical range.
+ * @~
  */
 static bool fp64_make_plan(uint32_t k, uint32_t precision_a, uint32_t precision_b,
                            fp64_crt_plan_t *plan)
@@ -168,6 +319,7 @@ static bool fp64_make_plan(uint32_t k, uint32_t precision_a, uint32_t precision_
 }
 
 /**
+ * @~japanese
  * @brief 必要な容量のMetalバッファーを確保または再利用する。
  * @param[in,out] backend 作業領域を所有する計算器。
  * @param[in] kind バッファーの用途。
@@ -175,6 +327,15 @@ static bool fp64_make_plan(uint32_t k, uint32_t precision_a, uint32_t precision_
  * @param[in,out] measurement 使用量の加算先。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 操作の成否。
+ * @~english
+ * @brief Allocate or reuse a Metal buffer with the required capacity.
+ * @param[in,out] backend Multiplier owning the workspace.
+ * @param[in] kind Buffer role.
+ * @param[in] bytes Required number of bytes.
+ * @param[in,out] measurement Measurement to which resource usage is added.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Status of the operation.
+ * @~
  */
 static apple_fp64_status_t fp64_reserve_buffer(AppleFP64Multiplier *backend, fp64_workspace_t kind,
                                               size_t bytes, apple_fp64_measurement_t *measurement,
@@ -196,6 +357,7 @@ static apple_fp64_status_t fp64_reserve_buffer(AppleFP64Multiplier *backend, fp6
 }
 
 /**
+ * @~japanese
  * @brief 入力解析の結果に対応するCRT係数を再利用または作成する。
  * @param[in,out] backend 復元係数を所有する計算器。
  * @param[in] inner 内積の項数。
@@ -203,6 +365,15 @@ static apple_fp64_status_t fp64_reserve_buffer(AppleFP64Multiplier *backend, fp6
  * @param[out] modular CRTで必要な整数幅を保持できる場合はtrue。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 係数の準備の成否。CRTの範囲を超える場合も正常終了する。
+ * @~english
+ * @brief Reuse or construct CRT coefficients corresponding to the input analysis.
+ * @param[in,out] backend Multiplier owning the reconstruction coefficients.
+ * @param[in] inner Number of terms in each dot product.
+ * @param[in] analysis Input integer widths and presence of nonfinite values.
+ * @param[out] modular true if CRT can retain the required integer widths.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Status of coefficient preparation. Exceeding the CRT range is also a successful outcome.
+ * @~
  */
 static apple_fp64_status_t fp64_prepare_plan(AppleFP64Multiplier *backend, uint32_t inner,
                                             const fp64_input_analysis_t *analysis, bool *modular,
@@ -226,6 +397,7 @@ static apple_fp64_status_t fp64_prepare_plan(AppleFP64Multiplier *backend, uint3
 }
 
 /**
+ * @~japanese
  * @brief 一つのMetalカーネルから計算パイプラインを作成する。
  * @param[in] backend 使用するデバイスを所有する計算器。
  * @param[in] library コンパイル済みのMetalライブラリー。
@@ -233,6 +405,15 @@ static apple_fp64_status_t fp64_prepare_plan(AppleFP64Multiplier *backend, uint3
  * @param[out] status 失敗時の分類。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 作成したパイプライン。失敗時はnil。
+ * @~english
+ * @brief Create a compute pipeline from one Metal kernel.
+ * @param[in] backend Multiplier owning the device in use.
+ * @param[in] library Compiled Metal library.
+ * @param[in] name Kernel name.
+ * @param[out] status Status on failure.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Created pipeline. nil on failure.
+ * @~
  */
 static id<MTLComputePipelineState> fp64_pipeline(AppleFP64Multiplier *backend, id<MTLLibrary> library,
                                                NSString *name, apple_fp64_status_t *status,
@@ -254,11 +435,19 @@ static id<MTLComputePipelineState> fp64_pipeline(AppleFP64Multiplier *backend, i
 }
 
 /**
+ * @~japanese
  * @brief 未投入のMetalの実行指示を作成する。
  * @param[in] backend 実行待ち行列を所有する計算器。
  * @param[out] status 失敗時の分類。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 作成した指示。失敗時はnil。
+ * @~english
+ * @brief Create an uncommitted Metal command buffer.
+ * @param[in] backend Multiplier owning the command queue.
+ * @param[out] status Status on failure.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Created command buffer. nil on failure.
+ * @~
  */
 static id<MTLCommandBuffer> fp64_command(AppleFP64Multiplier *backend, apple_fp64_status_t *status,
                                         apple_fp64_error_t *error)
@@ -269,12 +458,21 @@ static id<MTLCommandBuffer> fp64_command(AppleFP64Multiplier *backend, apple_fp6
 }
 
 /**
+ * @~japanese
  * @brief Metalの計算エンコーダーを作成する。
  * @param[in] command 未投入の指示。
  * @param[in] dispatch_type 同じエンコーダーの処理を実行する順序。
  * @param[out] status 失敗時の分類。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 作成したエンコーダー。失敗時はnil。
+ * @~english
+ * @brief Create a Metal compute command encoder.
+ * @param[in] command Uncommitted command buffer.
+ * @param[in] dispatch_type Dispatch ordering within the same encoder.
+ * @param[out] status Status on failure.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Created encoder. nil on failure.
+ * @~
  */
 static id<MTLComputeCommandEncoder> fp64_encoder(id<MTLCommandBuffer> command, MTLDispatchType dispatch_type,
                                                 apple_fp64_status_t *status, apple_fp64_error_t *error)
@@ -285,11 +483,19 @@ static id<MTLComputeCommandEncoder> fp64_encoder(id<MTLCommandBuffer> command, M
 }
 
 /**
+ * @~japanese
  * @brief 線形の要素列を、二次元のGPU実行範囲へ割り当てる。
  * @param[in] encoder 設定済みのエンコーダー。
  * @param[in] pipeline 実行するパイプライン。
  * @param[in] count 正の要素数。
  * @param[in] copies 同じ形で実行する範囲の個数。
+ * @~english
+ * @brief Map a linear element sequence to a two-dimensional GPU dispatch grid.
+ * @param[in] encoder Configured encoder.
+ * @param[in] pipeline Pipeline to execute.
+ * @param[in] count Positive number of elements.
+ * @param[in] copies Number of dispatch grids with the same shape.
+ * @~
  */
 static void fp64_dispatch_elements(id<MTLComputeCommandEncoder> encoder,
                                    id<MTLComputePipelineState> pipeline, size_t count, size_t copies)
@@ -302,12 +508,21 @@ static void fp64_dispatch_elements(id<MTLComputeCommandEncoder> encoder,
 }
 
 /**
+ * @~japanese
  * @brief GPUの指数取得を記録する。
  * @param[in] backend パイプラインと作業領域を所有する計算器。
  * @param[in] encoder 入力解析をまとめるエンコーダー。
  * @param[in] parameters 入力全体の寸法。
  * @param[in] input_b Bを処理する場合はtrue、Aの場合はfalse。
  * @param[in] inner_axis Aの列またはBの行を解析し、指数調整の準備を行う場合はtrue。
+ * @~english
+ * @brief Encode GPU exponent analysis.
+ * @param[in] backend Multiplier owning the pipelines and workspace.
+ * @param[in] encoder Encoder grouping the input analysis commands.
+ * @param[in] parameters Dimensions of the entire input.
+ * @param[in] input_b true when processing B, false for A.
+ * @param[in] inner_axis true when analyzing columns of A or rows of B to prepare exponent adjustments.
+ * @~
  */
 static void fp64_encode_scales(AppleFP64Multiplier *backend, id<MTLComputeCommandEncoder> encoder,
                                fp64_batch_parameters_t parameters, bool input_b, bool inner_axis)
@@ -333,12 +548,21 @@ static void fp64_encode_scales(AppleFP64Multiplier *backend, id<MTLComputeComman
 }
 
 /**
+ * @~japanese
  * @brief GPUで入力を解析し、計算方式を選ぶための情報を受け取る。
  * @param[in] backend パイプラインと作業領域を所有する計算器。
  * @param[in] parameters 入力全体の寸法。
  * @param[in,out] measurement GPUの解析時間とCPUの待ち時間の加算先。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 操作の成否。
+ * @~english
+ * @brief Analyze inputs on the GPU and receive the information needed to select the computation method.
+ * @param[in] backend Multiplier owning the pipelines and workspace.
+ * @param[in] parameters Dimensions of the entire input.
+ * @param[in,out] measurement Measurement to which GPU analysis time and CPU wait time are added.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Status of the operation.
+ * @~
  */
 static apple_fp64_status_t fp64_analyse_inputs(AppleFP64Multiplier *backend,
                                               fp64_batch_parameters_t parameters,
@@ -384,6 +608,7 @@ static apple_fp64_status_t fp64_analyse_inputs(AppleFP64Multiplier *backend,
 }
 
 /**
+ * @~japanese
  * @brief GPUの余りの生成を記録する。
  * @param[in] backend パイプラインと作業領域を所有する計算器。
  * @param[in] command 未投入の指示。
@@ -391,6 +616,15 @@ static apple_fp64_status_t fp64_analyse_inputs(AppleFP64Multiplier *backend,
  * @param[in] columns Bを処理する場合は1、Aの場合は0。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 操作の成否。
+ * @~english
+ * @brief Encode GPU residue generation.
+ * @param[in] backend Multiplier owning the pipelines and workspace.
+ * @param[in] command Uncommitted command buffer.
+ * @param[in] parameters Matrix dimensions and integer widths.
+ * @param[in] columns One when processing B, zero for A.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Status of the operation.
+ * @~
  */
 static apple_fp64_status_t fp64_encode_prepare(AppleFP64Multiplier *backend, id<MTLCommandBuffer> command,
                                               fp64_batch_parameters_t parameters, fp64_word_t columns,
@@ -421,6 +655,7 @@ static apple_fp64_status_t fp64_encode_prepare(AppleFP64Multiplier *backend, id<
 }
 
 /**
+ * @~japanese
  * @brief すべての法の行列積を一括して記録する。
  * @param[in] backend パイプラインと作業領域を所有する計算器。
  * @param[in] command 未投入の指示。
@@ -428,6 +663,15 @@ static apple_fp64_status_t fp64_encode_prepare(AppleFP64Multiplier *backend, id<
  * @param[in] count 法の個数。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 操作の成否。
+ * @~english
+ * @brief Encode matrix multiplication for all moduli in a single dispatch.
+ * @param[in] backend Multiplier owning the pipelines and workspace.
+ * @param[in] command Uncommitted command buffer.
+ * @param[in] parameters Matrix dimensions.
+ * @param[in] count Number of moduli.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Status of the operation.
+ * @~
  */
 static apple_fp64_status_t fp64_encode_product(AppleFP64Multiplier *backend, id<MTLCommandBuffer> command,
                                               fp64_batch_parameters_t parameters, fp64_word_t count,
@@ -460,6 +704,7 @@ static apple_fp64_status_t fp64_encode_product(AppleFP64Multiplier *backend, id<
 }
 
 /**
+ * @~japanese
  * @brief GPUのCRTと丸めを記録する。
  * @param[in] backend パイプラインと作業領域を所有する計算器。
  * @param[in] command 未投入の指示。
@@ -468,6 +713,16 @@ static apple_fp64_status_t fp64_encode_product(AppleFP64Multiplier *backend, id<
  * @param[out] output 呼び出し側へ返す出力と共有するMetalバッファー。
  * @param[out] error 診断の格納先。NULLを許容する。
  * @return 操作の成否。
+ * @~english
+ * @brief Encode GPU CRT reconstruction and rounding.
+ * @param[in] backend Multiplier owning the pipelines and workspace.
+ * @param[in] command Uncommitted command buffer.
+ * @param[in] parameters Matrix dimensions and integer widths.
+ * @param[in] limbs Required number of integer digits.
+ * @param[out] output Metal buffer sharing storage with the output returned to the caller.
+ * @param[out] error Destination for the diagnostic. May be NULL.
+ * @return Status of the operation.
+ * @~
  */
 static apple_fp64_status_t fp64_encode_reconstruct(AppleFP64Multiplier *backend, id<MTLCommandBuffer> command,
                                                   fp64_batch_parameters_t parameters, fp64_word_t limbs,

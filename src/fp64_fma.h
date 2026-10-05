@@ -3,18 +3,42 @@
 
 #include "arithmetic.h"
 
-#define FP64_NONFINITE_SCALE (972) /**< 無限大とNaNの乗数を分解したときの指数。 */
+#define FP64_NONFINITE_SCALE (972) /**< @~japanese 無限大とNaNの乗数を分解したときの指数。
+                                    * @~english Exponent used when unpacking infinite and NaN multiplicands.
+                                    * @~
+                                    */
 
-/** @brief 複数の積和演算で再利用する、分解済みのFP64の乗数。 */
+/**
+ * @~japanese
+ * @brief 複数の積和演算で再利用する、分解済みのFP64の乗数。
+ * @~english
+ * @brief Unpacked FP64 multiplicand reused across fused multiply-add operations.
+ * @~
+ */
 typedef struct fp64_fma_operand_s {
-    fp64_bits_t significand; /**< 非負の仮数と、上位語の最上位ビットに置く符号。 */
-    int scale; /**< 仮数に掛ける2のべき乗の指数。非有限値ではFP64_NONFINITE_SCALE。 */
+    fp64_bits_t significand; /**< @~japanese 非負の仮数と、上位語の最上位ビットに置く符号。
+                              * @~english Nonnegative significand with the sign stored in the most significant
+                              * bit of the high word.
+                              * @~
+                              */
+    int scale; /**< @~japanese 仮数に掛ける2のべき乗の指数。非有限値ではFP64_NONFINITE_SCALE。
+                * @~english Exponent of the power of two multiplying the significand. FP64_NONFINITE_SCALE for
+                * nonfinite values.
+                * @~
+                */
 } fp64_fma_operand_t;
 
 /**
+ * @~japanese
  * @brief FP64の乗数を、符号付きの仮数と指数へ分解する。
  * @param[in] bits FP64のビット列。
  * @return 積和演算で再利用できる乗数。非有限値では仮数部のビット列を保持する。
+ * @~english
+ * @brief Unpack an FP64 multiplicand into a signed significand and exponent.
+ * @param[in] bits FP64 bit pattern.
+ * @return Multiplicand reusable in fused multiply-add operations. Retains the fraction bit pattern for
+ * nonfinite values.
+ * @~
  */
 static inline fp64_fma_operand_t fp64_unpack_operand(fp64_bits_t bits) {
     fp64_word_t exponent = (bits.high >> 20) & 2047u;
@@ -24,17 +48,31 @@ static inline fp64_fma_operand_t fp64_unpack_operand(fp64_bits_t bits) {
 }
 
 /**
+ * @~japanese
  * @brief FP64の積と加数を揃える128ビットの符号なし整数。
+ * @~english
+ * @brief Unsigned 128-bit integer used to align an FP64 product and addend.
+ * @~
  */
 typedef struct fp64_uint128_s {
-    fp64_word_t words[4]; /**< 下位から並ぶ32ビットの語。 */
+    fp64_word_t words[4]; /**< @~japanese 下位から並ぶ32ビットの語。
+                           * @~english 32-bit words ordered from least to most significant.
+                           * @~
+                           */
 } fp64_uint128_t;
 
 /**
+ * @~japanese
  * @brief 32ビットの積の上位を求める。
  * @param[in] a 第一の整数。
  * @param[in] b 第二の整数。
  * @return 積の上位32ビット。
+ * @~english
+ * @brief Compute the high word of a 32-bit multiplication.
+ * @param[in] a First integer.
+ * @param[in] b Second integer.
+ * @return High 32 bits of the product.
+ * @~
  */
 static inline fp64_word_t fp64_multiply_high(fp64_word_t a, fp64_word_t b) {
 #ifdef __METAL_VERSION__
@@ -45,9 +83,15 @@ static inline fp64_word_t fp64_multiply_high(fp64_word_t a, fp64_word_t b) {
 }
 
 /**
+ * @~japanese
  * @brief 128ビット整数の有効な桁数を求める。
  * @param[in] value 非負整数。
  * @return 最上位ビットの位置に1を加えた値。ゼロでは0。
+ * @~english
+ * @brief Compute the bit length of a 128-bit integer.
+ * @param[in] value Nonnegative integer.
+ * @return One plus the position of the most significant bit. Zero for a zero value.
+ * @~
  */
 static inline fp64_word_t fp64_uint128_length(fp64_uint128_t value) {
     for (int i = 3; i >= 0; --i)
@@ -56,11 +100,20 @@ static inline fp64_word_t fp64_uint128_length(fp64_uint128_t value) {
 }
 
 /**
+ * @~japanese
  * @brief 下位の非ゼロの情報を最下位ビットへ集めながら指数を揃える。
  * @param[in] value 非負整数。
  * @param[in] shift 正なら左、負なら右へずらすビット数。
  * @return 指数を揃えた整数。
  * @pre 左シフトした値が128ビットに収まること。
+ * @~english
+ * @brief Align exponents while collecting information about discarded nonzero bits in the least significant
+ * bit.
+ * @param[in] value Nonnegative integer.
+ * @param[in] shift Bit shift count. Positive shifts left; negative shifts right.
+ * @return Integer with its exponent aligned.
+ * @pre The left-shifted value must fit in 128 bits.
+ * @~
  */
 static inline fp64_uint128_t fp64_uint128_align(fp64_uint128_t value, int shift) {
     if (shift >= 0) {
@@ -98,11 +151,19 @@ static inline fp64_uint128_t fp64_uint128_align(fp64_uint128_t value, int shift)
 }
 
 /**
+ * @~japanese
  * @brief 128ビット整数と指数から最近接偶数丸めしたFP64を求める。
  * @param[in] value 絶対値の整数。
  * @param[in] negative 符号。
  * @param[in] scale 2のべき乗の指数。
  * @return FP64のビット列。整数がゼロの場合は正のゼロ。
+ * @~english
+ * @brief Convert a 128-bit integer and exponent to FP64 using round-to-nearest, ties-to-even.
+ * @param[in] value Integer magnitude.
+ * @param[in] negative Sign.
+ * @param[in] scale Exponent of the power of two.
+ * @return FP64 bit pattern. Positive zero when the integer is zero.
+ * @~
  */
 static inline fp64_bits_t fp64_uint128_pack(fp64_uint128_t value, bool negative, int scale) {
     fp64_word_t length = fp64_uint128_length(value);
@@ -134,10 +195,17 @@ static inline fp64_bits_t fp64_uint128_pack(fp64_uint128_t value, bool negative,
 }
 
 /**
+ * @~japanese
  * @brief 53ビットの仮数同士を誤差なく掛ける。
  * @param[in] a 第一の仮数。
  * @param[in] b 第二の仮数。
  * @return 最大106ビットの積。
+ * @~english
+ * @brief Multiply two 53-bit significands exactly.
+ * @param[in] a First significand.
+ * @param[in] b Second significand.
+ * @return Product of at most 106 bits.
+ * @~
  */
 static inline fp64_uint128_t fp64_multiply_significands(fp64_bits_t a, fp64_bits_t b) {
     fp64_word_t first = a.low * b.high, second = a.high * b.low;
@@ -154,6 +222,7 @@ static inline fp64_uint128_t fp64_multiply_significands(fp64_bits_t a, fp64_bits
 }
 
 /**
+ * @~japanese
  * @brief FP64の積と加算を合わせて最近接偶数丸めする。
  * @param[in] a 分解済みの第一の乗数。
  * @param[in] b 分解済みの第二の乗数。
@@ -163,6 +232,17 @@ static inline fp64_uint128_t fp64_multiply_significands(fp64_bits_t a, fp64_bits
  * @pre aとbはfp64_unpack_operandで分解した値であること。
  * @pre finite_inputsがtrueの場合、aとbは有限であること。
  * @note CPUの浮動小数点演算と例外フラグを使用しない。
+ * @~english
+ * @brief Round the combined FP64 product and addition using round-to-nearest, ties-to-even.
+ * @param[in] a First unpacked multiplicand.
+ * @param[in] b Second unpacked multiplicand.
+ * @param[in] c Bit pattern of the addend.
+ * @param[in] finite_inputs true when both multiplicands are known to be finite.
+ * @return FP64 bit pattern following README.en.md, section "Numerical semantics".
+ * @pre a and b must have been unpacked by fp64_unpack_operand.
+ * @pre a and b must be finite when finite_inputs is true.
+ * @note Does not use CPU floating-point arithmetic or exception flags.
+ * @~
  */
 static inline fp64_bits_t fp64_fused_multiply_add(fp64_fma_operand_t a, fp64_fma_operand_t b, fp64_bits_t c, bool finite_inputs) {
     fp64_word_t ec = (c.high >> 20) & 2047u;

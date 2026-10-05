@@ -6,9 +6,15 @@
 #include <string.h>
 
 /**
+ * @~japanese
  * @brief 全指数範囲のビット列を作るための乱数の状態を進める。
  * @param[in,out] state 非ゼロの乱数の状態。
  * @return 次の64ビットの値。
+ * @~english
+ * @brief Advance the random state used to generate bit patterns across the full exponent range.
+ * @param[in,out] state Nonzero random state.
+ * @return Next 64-bit value.
+ * @~
  */
 static uint64_t fp64_next_bits(uint64_t *state)
 {
@@ -19,8 +25,13 @@ static uint64_t fp64_next_bits(uint64_t *state)
 }
 
 /**
+ * @~japanese
  * @brief CPUとGPUで共有する積和演算を、CPUのFP64の積和演算と比較する。
  * @return ビット列が一致した場合は0。
+ * @~english
+ * @brief Compare fused multiply-add shared by the CPU and GPU against CPU FP64 fused multiply-add.
+ * @return Zero if the bit patterns match.
+ * @~
  */
 int main(void)
 {

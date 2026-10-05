@@ -14,10 +14,17 @@
 #include <sys/stat.h>
 
 /**
+ * @~japanese
  * @brief コマンド引数を32ビットの非負整数へ変換する。
  * @param[in] text 十進数の引数。
  * @param[out] value 非負整数。
  * @return 全文字を変換できた場合はtrue。
+ * @~english
+ * @brief Convert a command-line argument to a nonnegative 32-bit integer.
+ * @param[in] text Decimal argument.
+ * @param[out] value Nonnegative integer.
+ * @return true if every character was converted.
+ * @~
  */
 static bool fp64_parse_number(const char *text, uint32_t *value)
 {
@@ -37,11 +44,19 @@ invalid:
 }
 
 /**
+ * @~japanese
  * @brief FP64行列のファイルのバイト数を算出する。
  * @param[in] rows 行数。
  * @param[in] columns 列数。
  * @param[out] bytes 行列のバイト数。
  * @return 寸法とファイルのサイズを表現できる場合はtrue。
+ * @~english
+ * @brief Compute the size in bytes of an FP64 matrix file.
+ * @param[in] rows Number of rows.
+ * @param[in] columns Number of columns.
+ * @param[out] bytes Matrix size in bytes.
+ * @return true if the dimensions and file size are representable.
+ * @~
  */
 static bool fp64_matrix_bytes(uint32_t rows, uint32_t columns, size_t *bytes)
 {
@@ -59,6 +74,7 @@ static bool fp64_matrix_bytes(uint32_t rows, uint32_t columns, size_t *bytes)
 }
 
 /**
+ * @~japanese
  * @brief FP64のビット列を、行優先のバイナリーファイルから読む。
  * @param[in] path 入力ファイル。
  * @param[in] rows 行数。
@@ -66,6 +82,15 @@ static bool fp64_matrix_bytes(uint32_t rows, uint32_t columns, size_t *bytes)
  * @param[out] values 呼び出し側がfreeで解放する配列。空の場合はNULL。
  * @param[out] count 要素数。
  * @return 入力を読み込めた場合はtrue。失敗理由を標準エラー出力へ書く。
+ * @~english
+ * @brief Read FP64 bit patterns from a row-major binary file.
+ * @param[in] path Input file.
+ * @param[in] rows Number of rows.
+ * @param[in] columns Number of columns.
+ * @param[out] values Array to be released by the caller with free. NULL when empty.
+ * @param[out] count Number of elements.
+ * @return true if the input was read. Write the failure reason to standard error.
+ * @~
  */
 static bool fp64_read_matrix(const char *path, uint32_t rows, uint32_t columns,
                              double **values, size_t *count)
@@ -108,8 +133,13 @@ finish:
 }
 
 /**
+ * @~japanese
  * @brief 実行ファイルと同じディレクトリーにあるMetalライブラリーのパスを求める。
  * @return 呼び出し側がfreeで解放するパス。取得失敗時はNULL。
+ * @~english
+ * @brief Find the path of the Metal library in the same directory as the executable.
+ * @return Path to be released by the caller with free. NULL if the path could not be obtained.
+ * @~
  */
 static char *fp64_library_path(void)
 {
@@ -145,9 +175,15 @@ static char *fp64_library_path(void)
 }
 
 /**
+ * @~japanese
  * @brief ライブラリーの診断を標準エラー出力へ書き、メッセージを解放する。
  * @param[in,out] error 失敗した操作の診断。
  * @pre 診断がNULLである失敗はCPUのメモリー確保の失敗だけであること。
+ * @~english
+ * @brief Write the library diagnostic to standard error and release the message.
+ * @param[in,out] error Diagnostic for the failed operation.
+ * @pre A NULL diagnostic must indicate only a CPU memory allocation failure.
+ * @~
  */
 static void fp64_print_error(apple_fp64_error_t *error)
 {
@@ -156,9 +192,15 @@ static void fp64_print_error(apple_fp64_error_t *error)
 }
 
 /**
+ * @~japanese
  * @brief コマンドが使用するMetalの計算器を作成する。
  * @param[out] multiplier 成功時の計算器。
  * @return 作成できた場合はtrue。
+ * @~english
+ * @brief Create the Metal multiplier used by the command-line tool.
+ * @param[out] multiplier Multiplier on success.
+ * @return true if creation succeeded.
+ * @~
  */
 static bool fp64_create_multiplier(apple_fp64_multiplier_t **multiplier)
 {
@@ -172,10 +214,17 @@ static bool fp64_create_multiplier(apple_fp64_multiplier_t **multiplier)
 }
 
 /**
+ * @~japanese
  * @brief 指定されたファイルの行列積を計算する。
  * @param[in] argc 引数の個数。
  * @param[in] argv コマンド引数。
  * @return 正常終了の場合は0、入力または実行の失敗では1。
+ * @~english
+ * @brief Compute the matrix product from the specified files.
+ * @param[in] argc Number of arguments.
+ * @param[in] argv Command-line arguments.
+ * @return Zero on success, one on input or execution failure.
+ * @~
  */
 static int fp64_multiply_files(int argc, char **argv)
 {
@@ -228,16 +277,34 @@ finish:
     return exit_code;
 }
 
-/** @brief mt19937_64の状態。性能測定の入力を再現する。 */
+/**
+ * @~japanese
+ * @brief mt19937_64の状態。性能測定の入力を再現する。
+ * @~english
+ * @brief State of mt19937_64 used to reproduce benchmark inputs.
+ * @~
+ */
 typedef struct fp64_random_s {
-    uint64_t state[312]; /**< Mersenne Twisterの状態の語。 */
-    size_t position; /**< 次に取り出す語の位置。312では状態を更新する。 */
+    uint64_t state[312]; /**< @~japanese Mersenne Twisterの状態の語。
+                          * @~english Words of the Mersenne Twister state.
+                          * @~
+                          */
+    size_t position; /**< @~japanese 次に取り出す語の位置。312では状態を更新する。
+                      * @~english Position of the next word to extract. Update the state at 312.
+                      * @~
+                      */
 } fp64_random_t;
 
 /**
+ * @~japanese
  * @brief 性能測定用の乱数列を初期化する。
  * @param[out] random 初期化する状態。
  * @param[in] seed 乱数の種。
+ * @~english
+ * @brief Initialize the random sequence used for benchmarking.
+ * @param[out] random State to initialize.
+ * @param[in] seed Random seed.
+ * @~
  */
 static void fp64_random_initialize(fp64_random_t *random, uint64_t seed)
 {
@@ -249,9 +316,15 @@ static void fp64_random_initialize(fp64_random_t *random, uint64_t seed)
 }
 
 /**
+ * @~japanese
  * @brief mt19937_64から、区間[-1,1)のFP64の入力値を求める。
  * @param[in,out] random 乱数の状態。
  * @return 一様分布の行列の要素。
+ * @~english
+ * @brief Generate an FP64 input value in the interval [-1,1) from mt19937_64.
+ * @param[in,out] random Random state.
+ * @return Uniformly distributed matrix element.
+ * @~
  */
 static double fp64_random_value(fp64_random_t *random)
 {
@@ -275,10 +348,17 @@ static double fp64_random_value(fp64_random_t *random)
 }
 
 /**
+ * @~japanese
  * @brief 二つの測定値をqsortで比較する。
  * @param[in] left 左のdoubleへのポインター。
  * @param[in] right 右のdoubleへのポインター。
  * @return 左が小さい場合は負、等しい場合は0、大きい場合は正。
+ * @~english
+ * @brief Compare two measurements for qsort.
+ * @param[in] left Pointer to the left double.
+ * @param[in] right Pointer to the right double.
+ * @return Negative if the left value is smaller, zero if equal, and positive if greater.
+ * @~
  */
 static int fp64_compare_samples(const void *left, const void *right)
 {
@@ -287,10 +367,17 @@ static int fp64_compare_samples(const void *left, const void *right)
 }
 
 /**
+ * @~japanese
  * @brief 全試行の測定値をソートし、中央値を求める。
  * @param[in,out] samples 測定値。昇順に並べ替える。
  * @param[in] count 正の試行回数。
  * @return 偶数個の場合は中央の二値の平均、それ以外は中央の値。
+ * @~english
+ * @brief Sort measurements from all trials and compute their median.
+ * @param[in,out] samples Measurements. Sorted in ascending order.
+ * @param[in] count Positive number of trials.
+ * @return Mean of the two middle values for an even count, otherwise the middle value.
+ * @~
  */
 static double fp64_median(double *samples, size_t count)
 {
@@ -299,18 +386,46 @@ static double fp64_median(double *samples, size_t count)
     return count % 2 ? samples[middle] : (samples[middle - 1] + samples[middle]) / 2;
 }
 
-/** @brief 性能比較の一方式について保持する全試行の測定値。 */
+/**
+ * @~japanese
+ * @brief 性能比較の一方式について保持する全試行の測定値。
+ * @~english
+ * @brief Measurements from all trials retained for one method in the performance comparison.
+ * @~
+ */
 typedef struct fp64_benchmark_series_s {
-    const char *name; /**< 方式名。 */
-    double *total; /**< 試行ごとの全体の実時間。 */
-    double *prepare; /**< 試行ごとの入力変換の時間。 */
-    double *product; /**< 試行ごとのGPUの行列積の時間。 */
-    double *reconstruct; /**< 試行ごとの復元の時間。 */
-    double *wait; /**< 試行ごとのCPUの待ち時間。 */
-    apple_fp64_measurement_t latest; /**< 最後の試行の資源量。 */
+    const char *name; /**< @~japanese 方式名。
+                       * @~english Method name.
+                       * @~
+                       */
+    double *total; /**< @~japanese 試行ごとの全体の実時間。
+                    * @~english Total wall-clock time for each trial.
+                    * @~
+                    */
+    double *prepare; /**< @~japanese 試行ごとの入力変換の時間。
+                      * @~english Input conversion time for each trial.
+                      * @~
+                      */
+    double *product; /**< @~japanese 試行ごとのGPUの行列積の時間。
+                      * @~english GPU matrix multiplication time for each trial.
+                      * @~
+                      */
+    double *reconstruct; /**< @~japanese 試行ごとの復元の時間。
+                          * @~english Reconstruction time for each trial.
+                          * @~
+                          */
+    double *wait; /**< @~japanese 試行ごとのCPUの待ち時間。
+                   * @~english CPU wait time for each trial.
+                   * @~
+                   */
+    apple_fp64_measurement_t latest; /**< @~japanese 最後の試行の資源量。
+                                      * @~english Resource usage from the last trial.
+                                      * @~
+                                      */
 } fp64_benchmark_series_t;
 
 /**
+ * @~japanese
  * @brief 同じ方式を連続して実行し、行列積一回当たりの時間を求める。
  * @param[in] method Accelerateは0、AppleSilicon-FP64は1。
  * @param[in] repetitions 区間内の反復回数。正の値。
@@ -324,6 +439,21 @@ typedef struct fp64_benchmark_series_s {
  * @param[out] error 実行に失敗した場合の診断。
  * @return 全反復に成功した場合はtrue。
  * @note 時間の範囲と反復の意味はREADME.md「コマンドの使用方法」で定める。
+ * @~english
+ * @brief Run the same method repeatedly and measure the time per matrix product.
+ * @param[in] method Zero for Accelerate, one for AppleSilicon-FP64.
+ * @param[in] repetitions Positive number of repetitions within the interval.
+ * @param[in,out] multiplier GPU multiplier.
+ * @param[in] a n-by-n input.
+ * @param[in] b n-by-n input.
+ * @param[out] reference n-by-n array storing the Accelerate output.
+ * @param[in] n Matrix order.
+ * @param[in] options GPU computation options.
+ * @param[out] measurement Mean time for each stage and resource usage from the last repetition.
+ * @param[out] error Diagnostic on execution failure.
+ * @return true if every repetition succeeded.
+ * @note Timing boundaries and repetition semantics are defined in README.en.md, section "Command-line usage".
+ * @~
  */
 static bool fp64_benchmark_interval(size_t method, uint32_t repetitions,
                                      apple_fp64_multiplier_t *multiplier,
@@ -362,10 +492,17 @@ static bool fp64_benchmark_interval(size_t method, uint32_t repetitions,
 }
 
 /**
+ * @~japanese
  * @brief AppleSilicon-FP64とAccelerateの性能を、同じ入力と試行回数で比較する。
  * @param[in] argc 引数の個数。
  * @param[in] argv コマンド引数。
  * @return 正常終了の場合は0、入力または実行の失敗では1。
+ * @~english
+ * @brief Compare AppleSilicon-FP64 and Accelerate performance using the same inputs and trial counts.
+ * @param[in] argc Number of arguments.
+ * @param[in] argv Command-line arguments.
+ * @return Zero on success, one on input or execution failure.
+ * @~
  */
 static int fp64_benchmark(int argc, char **argv)
 {
@@ -414,8 +551,15 @@ static int fp64_benchmark(int argc, char **argv)
     double *intervals = samples + (size_t)trials * 10;
     double *ratios = intervals + (size_t)trials * 4;
     double *deviations = ratios + trials;
-    const double warmup_seconds = 0.25; /**< 各方式に割り当てる準備実行の最小時間。 */
-    const double interval_seconds = 0.05; /**< 反復回数を決めるための区間の目標時間。 */
+    const double warmup_seconds = 0.25; /**< @~japanese 各方式に割り当てる準備実行の最小時間。
+                                         * @~english Minimum warm-up duration allocated to each method.
+                                         * @~
+                                         */
+    const double interval_seconds = 0.05; /**< @~japanese 反復回数を決めるための区間の目標時間。
+                                           * @~english Target interval duration used to choose the repetition
+                                           * count.
+                                           * @~
+                                           */
     uint32_t repetitions[2] = {1, 1};
     double warmed[2] = {0, 0};
     for (size_t round = 0; round < 2 || warmed[0] < warmup_seconds || warmed[1] < warmup_seconds; ++round) {
@@ -513,10 +657,17 @@ finish:
 }
 
 /**
+ * @~japanese
  * @brief 実験用コマンドの入口。
  * @param[in] argc 引数の個数。
  * @param[in] argv コマンド引数。
  * @return 正常終了では0、入力または実行の失敗では1。
+ * @~english
+ * @brief Entry point of the experimental command-line tool.
+ * @param[in] argc Number of arguments.
+ * @param[in] argv Command-line arguments.
+ * @return Zero on success, one on input or execution failure.
+ * @~
  */
 int main(int argc, char **argv)
 {

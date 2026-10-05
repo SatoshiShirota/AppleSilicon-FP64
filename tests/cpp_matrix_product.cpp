@@ -5,11 +5,19 @@
 #include <memory>
 
 /**
+ * @~japanese
  * @brief C++からCのヘッダーを使い、計算器と結果を操作する。
  * @param[in] argc 引数の個数。
  * @param[in] argv Metalライブラリーのパスを含む引数。
  * @return C++から行列積を利用できた場合は0。
  * @pre argcは2であること。
+ * @~english
+ * @brief Use the C header from C++ to manage the multiplier and result.
+ * @param[in] argc Number of arguments.
+ * @param[in] argv Arguments including the Metal library path.
+ * @return Zero if matrix multiplication was usable from C++.
+ * @pre argc must be 2.
+ * @~
  */
 int main(int argc, char **argv)
 {

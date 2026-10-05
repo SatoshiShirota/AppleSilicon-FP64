@@ -1,5 +1,7 @@
 # AppleSilicon-FP64
 
+日本語 | [English](README.en.md)
+
 Apple SiliconのMetalで、FP64形式の実数密行列積を計算するライブラリーと実験用コマンドである。公開APIとコマンドはC、Metalの資源管理と実行指示はObjective-Cで実装する。C++からも同じCのヘッダーと関数を利用できる。入力の値に応じて、整数剰余による行列積と、整数演算によるFP64の積和演算を選ぶ。値に依存する数値演算はすべてGPUで実行する。
 
 ## 用語
@@ -117,7 +119,7 @@ FP64の仮数同士の積を、最大106ビットの整数として求める。�
 
 ## 実行環境と資源
 
-Apple Silicon、macOS 26以降、Metal Shading Language 4をコンパイルできるXcode、CMakeが必要である。CPU側の実装にはC11とObjective-CのARCを使う。GPUカーネルはMetal Shading Languageで記述する。検証にはPython 3とC++コンパイラーを使う。外部の数値計算ライブラリーは実装に必要ない。性能比較にはmacOSのAccelerateを使う。
+Apple Silicon、macOS 26以降、Metal Shading Language 4をコンパイルできるXcode、CMakeが必要である。CMakeの最低バージョンは[CMakeLists.txt](CMakeLists.txt)の`cmake_minimum_required`で定める。CPU側の実装にはC11とObjective-CのARCを使う。GPUカーネルはMetal Shading Languageで記述する。検証にはPython 3とC++コンパイラーを使う。外部の数値計算ライブラリーは実装に必要ない。性能比較にはmacOSのAccelerateを使う。
 
 行列の各次元はMetalのテンソルが表現できる符号付き32ビット整数の範囲とする。入力と出力、行と列の解析結果は行列全体について保持する。指数調整では、内積の項数と同じ個数の32ビット整数を追加で保持する。解析用の配列は、入力の行と列の両方を扱える容量まで拡張して再利用する。CRTの中間配列の容量は、使用する法の数と行のまとまりの大きさから決まる。FP64の積和演算では、行のまとまりの設定によって作業領域は変わらない。失敗は戻り値で分類し、診断メッセージを返す。資源不足やMetalの実行失敗をCPU計算へ置き換える処理は行わない。
 
@@ -145,7 +147,11 @@ ctest --test-dir build --output-on-failure
 
 ベンチマークでは、区間の実行順序を検証する。出力された区間の値から時間、速度比、絶対偏差を独立に集計し、表示された集計値と照合する。
 
+ライブラリーの導入は、独立したCとC++のプロジェクトから検証する。ソースを組み込む場合と、インストール先を移動したパッケージを使う場合の両方で、公開ヘッダーの読み込み、リンク、Metalファイルの取得と行列積を確認する。ソースを組み込む場合は、親の`BUILD_TESTING`が有効でも本ライブラリーのコマンドとテストが追加されないことを確認する。
+
 ライブラリーとコマンドだけをビルドする場合は、CMakeに`-DBUILD_TESTING=OFF`を指定する。この構成ではC++コンパイラーとPythonを使わない。
+
+ライブラリーだけをビルドする場合は、さらに`-DAPPLE_FP64_BUILD_TOOLS=OFF`を指定する。`APPLE_FP64_BUILD_TOOLS`は単独ビルドで既定が`ON`、他のプロジェクトへ組み込む場合は既定が`OFF`となる。テストは単独ビルドで`BUILD_TESTING`が有効な場合に構築する。テストに必要なコマンドも、この場合は構築する。
 
 ## コマンドの使用方法
 
@@ -327,6 +333,8 @@ CRTを使う場合は、余りの行列と復元用の作業領域が必要に�
 
 公開する型、入出力の条件、所有権と失敗時の動作は`include/apple_fp64/matmul.h`で定義する。ヘッダーはC++で読み込む場合に`extern "C"`を適用する。ライブラリーを利用するためのC++のラッパーは必要ない。
 
+Doxygenコメントには日本語と英語の説明を含める。[Doxygenの言語切り替え](https://www.doxygen.nl/manual/commands.html#cmdtilde)を使い、`OUTPUT_LANGUAGE`を`Japanese`または`English`に設定すると、選んだ言語の説明を出力できる。
+
 `apple_fp64_multiplier_t`はMetalのパイプラインと作業領域を保持するため、複数の積について同じ計算器を再利用できる。作業領域の容量が不足する場合だけ、より大きい領域を確保する。
 
 次の例はCとC++の両方でコンパイルできる。
@@ -335,14 +343,18 @@ CRTを使う場合は、余りの行列と復元用の作業領域が必要に�
 #include <apple_fp64/matmul.h>
 #include <stdio.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc != 2) {
+        fprintf(stderr, "使用方法: %s /path/to/fp64.metallib\n", argv[0]);
+        return 1;
+    }
     const double a[] = {1, 2, 3, 4};
     const double b[] = {5, 6, 7, 8};
     apple_fp64_multiplier_t *multiplier = NULL;
     apple_fp64_result_t result = {0};
     apple_fp64_error_t error = {0};
-    apple_fp64_status_t status = apple_fp64_multiplier_create("build/fp64.metallib", &multiplier, &error);
+    apple_fp64_status_t status = apple_fp64_multiplier_create(argv[1], &multiplier, &error);
     if (status == APPLE_FP64_SUCCESS) {
         status = apple_fp64_multiply(multiplier, a, 4, b, 4, 2, 2, 2,
                                      apple_fp64_default_options(), &result, &error);
@@ -359,7 +371,61 @@ int main(void)
 }
 ```
 
-CMakeの`apple_fp64`ターゲットをリンクする。実行時には、ビルドで生成された`fp64.metallib`も配置する。
+### ソースから組み込む
+
+利用側の`CMakeLists.txt`に、ソースのディレクトリーを追加する。
+
+```cmake
+add_subdirectory(path/to/AppleSilicon-FP64 apple-fp64)
+```
+
+この利用方法では、ライブラリーと必要なMetalカーネルだけを既定でビルドする。利用側がC++コンパイラーやPythonを用意する必要はない。C++で書いた利用側のプログラムには、C++コンパイラーが必要である。
+
+### インストールして利用する
+
+「ビルドと検証」の手順で生成したライブラリーを、指定したディレクトリーへインストールする。
+
+```sh
+cmake --install build --prefix /path/to/apple-fp64
+```
+
+インストールには、静的ライブラリー、公開ヘッダー、Metalファイル、CMakeのパッケージ設定とLICENSEが含まれる。実験用コマンドとテストはインストールしない。
+
+利用側の`CMakeLists.txt`でパッケージを検索する。
+
+```cmake
+find_package(AppleSiliconFP64 CONFIG REQUIRED)
+```
+
+利用側の構成時に、インストール先を検索パスへ追加する。
+
+```sh
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/apple-fp64
+```
+
+インストール先のディレクトリー全体を移動しても利用できる。移動した場合は、移動先を検索パスへ指定する。
+
+### リンクとMetalファイルの配置
+
+どちらの導入方法でも、`AppleSiliconFP64::apple_fp64`をリンクする。公開ヘッダーの検索パスと、MetalおよびFoundationのリンク設定は、このターゲットから利用側へ伝わる。`AppleSiliconFP64_METALLIB`には、対応する`fp64.metallib`の絶対パスが入る。ソースを組み込んだ場合のファイルは、ビルド時に生成される。
+
+コマンドラインアプリケーションでは、次の例でMetalファイルを実行ファイルと同じディレクトリーへ配置できる。
+
+```cmake
+add_executable(my_app main.c)
+target_link_libraries(my_app PRIVATE AppleSiliconFP64::apple_fp64)
+add_custom_command(TARGET my_app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${AppleSiliconFP64_METALLIB}"
+        "$<TARGET_FILE_DIR:my_app>/fp64.metallib"
+    VERBATIM)
+```
+
+macOSのアプリケーションでは、Metalファイルをアプリケーションバンドルの資源として同梱する。実行時に配置先のパスを取得し、`apple_fp64_multiplier_create`へ渡す。ライブラリーはファイルを自動で検索しない。実行時の作業ディレクトリーに依存しないパスを指定する。
+
+## ライセンス
+
+利用条件は[LICENSE](LICENSE)で定める。
 
 ## 参考資料
 

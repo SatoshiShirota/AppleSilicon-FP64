@@ -9,6 +9,7 @@
 #include <string.h>
 
 /**
+ * @~japanese
  * @brief 一定値の行列について、同じ計算器による積の全ビットを検証する。
  * @param[in,out] multiplier 積を実行する計算器。
  * @param[in] m 出力の行数。
@@ -19,6 +20,18 @@
  * @param[in] options 行のまとまりの大きさ。
  * @return 出力の長さと値が一致した場合はtrue。
  * @pre 入力の整数化と期待値の算出に丸めが発生しない値を指定すること。
+ * @~english
+ * @brief Verify every output bit of constant-valued matrix products using the same multiplier.
+ * @param[in,out] multiplier Multiplier computing the product.
+ * @param[in] m Number of output rows.
+ * @param[in] n Number of output columns.
+ * @param[in] k Number of terms in each dot product.
+ * @param[in] a_value Value of every element in A.
+ * @param[in] b_value Value of every element in B.
+ * @param[in] options Row batch size.
+ * @return true if the output length and values match.
+ * @pre Input integer conversion and expected-value calculation must not require rounding.
+ * @~
  */
 static bool fp64_check_product(apple_fp64_multiplier_t *multiplier, uint32_t m, uint32_t n,
                                uint32_t k, double a_value, double b_value, apple_fp64_options_t options)
@@ -51,12 +64,24 @@ static bool fp64_check_product(apple_fp64_multiplier_t *multiplier, uint32_t m, 
 }
 
 /**
+ * @~japanese
  * @brief 行と列の係数を持つ大きな長方形の積を、厳密な整数の期待値と比較する。
  * @param[in,out] multiplier 積を実行する計算器。
  * @param[in] wide_exponents 内積方向に逆向きの指数を掛け、入力の範囲を広げる場合はtrue。
  * @return 全出力のビット列が一致した場合はtrue。
  * @note 行のまとまりに奇数を指定し、符号と指数が異なる行と列を含める。
  * @note 上下と左右のブロックで、整数化した値の下位ゼロビット数を変える。
+ * @~english
+ * @brief Compare a large rectangular product with row and column coefficients against exact integer
+ * expectations.
+ * @param[in,out] multiplier Multiplier computing the product.
+ * @param[in] wide_exponents true when applying opposite exponents along the inner dimension to widen the
+ * input range.
+ * @return true if every output bit pattern matches.
+ * @note Use an odd row batch size and include rows and columns with different signs and exponents.
+ * @note Vary the number of trailing zero bits in integer-converted values between the top, bottom, left, and
+ * right blocks.
+ * @~
  */
 static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier, bool wide_exponents)
 {
@@ -110,9 +135,16 @@ static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier, boo
 }
 
 /**
+ * @~japanese
  * @brief 同じ寸法で入力の指数範囲と特殊値を変え、計算器を再利用する。
  * @param[in,out] multiplier 積を実行する計算器。
  * @return 各入力の数値結果が一致した場合はtrue。
+ * @~english
+ * @brief Reuse the multiplier with the same dimensions while varying input exponent ranges and special
+ * values.
+ * @param[in,out] multiplier Multiplier computing the product.
+ * @return true if the numerical results match for each input.
+ * @~
  */
 static bool fp64_check_input_ranges(apple_fp64_multiplier_t *multiplier)
 {
@@ -138,9 +170,15 @@ static bool fp64_check_input_ranges(apple_fp64_multiplier_t *multiplier)
 }
 
 /**
+ * @~japanese
  * @brief 入力の長さが不正な場合、所有する出力を返さずに診断を返すことを検証する。
  * @param[in,out] multiplier 積を実行する計算器。
  * @return 定義された失敗を返した場合はtrue。
+ * @~english
+ * @brief Verify that invalid input lengths produce a diagnostic without returning owned output.
+ * @param[in,out] multiplier Multiplier computing the product.
+ * @return true if the defined failure is returned.
+ * @~
  */
 static bool fp64_check_rejected_length(apple_fp64_multiplier_t *multiplier)
 {
@@ -161,9 +199,15 @@ static bool fp64_check_rejected_length(apple_fp64_multiplier_t *multiplier)
 }
 
 /**
+ * @~japanese
  * @brief 読めないMetalライブラリーについて、計算器を返さずに診断を返すことを検証する。
  * @param[in] library_path コンパイル済みライブラリーのパス。
  * @return 定義された失敗を返した場合はtrue。
+ * @~english
+ * @brief Verify that an unreadable Metal library produces a diagnostic without returning a multiplier.
+ * @param[in] library_path Path to the compiled library.
+ * @return true if the defined failure is returned.
+ * @~
  */
 static bool fp64_check_unreadable_library(const char *library_path)
 {
@@ -184,11 +228,19 @@ static bool fp64_check_unreadable_library(const char *library_path)
 }
 
 /**
+ * @~japanese
  * @brief 寸法と入力を変え、同じ計算器を繰り返し使う。
  * @param[in] argc 引数の個数。
  * @param[in] argv Metalライブラリーのパスを含む引数。
  * @return すべての積と失敗動作が一致した場合は0。
  * @pre argcは2であること。
+ * @~english
+ * @brief Use the same multiplier repeatedly with different dimensions and inputs.
+ * @param[in] argc Number of arguments.
+ * @param[in] argv Arguments including the Metal library path.
+ * @return Zero if every product and failure behavior matches.
+ * @pre argc must be 2.
+ * @~
  */
 int main(int argc, char **argv)
 {

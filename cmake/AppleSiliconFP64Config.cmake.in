@@ -1,0 +1,5 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/AppleSiliconFP64Targets.cmake")
+set_and_check(AppleSiliconFP64_METALLIB "@PACKAGE_apple_fp64_install_metallib@")
+check_required_components(AppleSiliconFP64)
