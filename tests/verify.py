@@ -23,7 +23,7 @@ class Case:
         a: 行優先の入力A。
         b: 行優先の入力B。
         batch: 一度に処理する行数。
-        fused: 広い指数範囲または非有限値を含み、各積和演算で丸める入力。
+        fused: 指数調整後もCRTの範囲を超えるか非有限値を含み、各積和演算で丸める入力。
     """
 
     name: str
@@ -133,13 +133,24 @@ def matrix_cases():
         Case("CRTで表せる広い整数の積", 1, 1, 2, [1, 2.0**-168], [1, 2.0**-168]),
         Case("CRTの範囲を超える整数の積", 1, 1, 2, [1, 2.0**-169], [1, 2.0**-169], fused=True),
         Case("全有限範囲の小さい項を保持する", 1, 1, 2, [largest, tiny], [0, 1], fused=True),
-        Case("指数が逆向きの全有限範囲の積", 1, 1, 2, [largest, tiny], [tiny, largest], fused=True),
+        Case("指数が逆向きの全有限範囲の積", 1, 1, 2, [largest, tiny], [tiny, largest]),
+        Case("指数調整した内積は最後に一度だけ丸める", 1, 1, 3,
+             [2.0**500, 2.0**-500, 2.0**500], [2.0**-447, 2.0**500, -2.0**-447]),
+        Case("指数調整した大きな積の厳密な打ち消し", 1, 1, 2,
+             [2.0**1000, -2.0**30], [2.0**30, 2.0**1000]),
+        Case("指数調整で極小値とゼロの符号を保つ", 3, 2, 3,
+             [0, 2.0**-500, 0, 0, -tiny, 0, 2.0**-500, 2.0**500, 2.0**-500],
+             [2.0**500, 2.0**-500, 2.0**-500, 0, 2.0**500, 0], batch=1),
+        Case("指数調整しても広い内積の逐次丸め", 1, 1, 2,
+             [1 + 2.0**-27, 2.0**-200], [1 - 2.0**-27, -2.0**-200], fused=True),
         Case("積和演算は積を途中で丸めない", 1, 1, 3,
              [largest, -1, 1 + 2.0**-27], [0, 1, 1 - 2.0**-27], fused=True),
         Case("積和演算の中間値は偶数へ丸める", 3, 1, 3,
              [largest, 1, 2.0**-53,
               largest, math.nextafter(1, 2), 2.0**-53,
               largest, math.nextafter(2, 1), 2.0**-53], [0, 1, 1], fused=True),
+        Case("積和演算での打ち消しは正のゼロ", 2, 1, 3,
+             [largest, 1, -1, largest, -1, 1], [0, 1, 1], fused=True),
         Case("積の範囲を超えた値を加数が打ち消す", 1, 1, 3,
              [tiny, -largest, largest], [0, 1, 1.5], fused=True),
         Case("積和演算の負のアンダーフロー", 1, 1, 2, [largest, -tiny], [0, 0.5], fused=True),
@@ -147,7 +158,7 @@ def matrix_cases():
              [largest, minimum, -tiny], [0, 1, 0.5], fused=True),
         Case("NaNの静寂化と正規化", 2, 2, 1,
              [struct.unpack("<d", struct.pack("<Q", 0xfff0000000000001))[0], 1], [1, math.nan], fused=True),
-        Case("正負の無限大とゼロの積", 2, 3, 1, [math.inf, -math.inf], [1, -1, -0.0], fused=True),
+        Case("正負の無限大とゼロの積", 2, 3, 1, [math.inf, -math.inf], [math.inf, -1, -0.0], fused=True),
         Case("反対符号の無限大の和", 1, 1, 2, [math.inf, -math.inf], [1, 1], fused=True),
         Case("無限大の和と符号付きゼロ", 2, 2, 2, [math.inf, 1, -0.0, -0.0], [1, -0.0, 1, 0.0], fused=True),
         Case("INT32の内積を分割する長さ", 1, 1, 131073, [0.5] * 131073, [0.5] * 131073),
@@ -166,6 +177,13 @@ def matrix_cases():
         a = [math.ldexp(random_source.uniform(-1, 1), random_source.randint(-spread, spread)) for _ in range(m * k)]
         b = [math.ldexp(random_source.uniform(-1, 1), random_source.randint(-spread, spread)) for _ in range(k * n)]
         cases.append(Case(name, m, n, k, a, b, batch, fused))
+    m, n, k = 35, 37, 65
+    shifts = [-900, -500, 0, 500, 900]
+    a = [math.ldexp(random_source.uniform(-1, 1), shifts[inner % len(shifts)])
+         for row in range(m) for inner in range(k)]
+    b = [math.ldexp(random_source.uniform(-1, 1), -shifts[inner % len(shifts)])
+         for inner in range(k) for column in range(n)]
+    cases.append(Case("指数が逆向きの長方形の厳密な積", m, n, k, a, b, batch=7))
     a = [1.0] * (17 * 33)
     b = [1.0] * (33 * 19)
     a[-1], b[-1] = tiny, largest

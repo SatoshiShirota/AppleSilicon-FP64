@@ -37,7 +37,7 @@ int main(void)
         fp64_bits_t operands[3];
         for (unsigned i = 0; i < 3; ++i)
             operands[i] = (fp64_bits_t){(uint32_t)inputs[i], (uint32_t)(inputs[i] >> 32)};
-        fp64_bits_t result = fp64_fused_multiply_add(operands[0], operands[1], operands[2],
+        fp64_bits_t result = fp64_fused_multiply_add(fp64_unpack_operand(operands[0]), fp64_unpack_operand(operands[1]), operands[2],
                                                    isfinite(values[0]) && isfinite(values[1]));
         uint64_t actual = ((uint64_t)result.high << 32) | result.low;
         double reference = fma(values[0], values[1], values[2]);

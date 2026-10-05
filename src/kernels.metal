@@ -34,16 +34,21 @@ static inline int fp64_lowest_bit(fp64_bits_t bits) {
 }
 
 /**
- * @brief Aの行に含まれる最大値の指数を求める。
+ * @brief 行に含まれる最大値と最下位ビットの指数を求める。
+ * @tparam shifted 内積方向の指数を調整する場合はtrue。
  * @param[in] input FP64のビット列。
  * @param[out] scales 各行の最大値と最下位ビットの指数、非有限値の有無。
  * @param[in] parameters 行列の寸法。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
  * @param[in] group 担当する行。
  * @param[in] lane SIMDグループ内のスレッド位置。
+ * @pre shiftedがtrueの場合、入力は有限値だけを含むAであること。
  */
+template <bool shifted>
 kernel void find_row_scales(device const fp64_bits_t* input [[buffer(0)]],
                         device fp64_scale_t* scales [[buffer(1)]],
                         constant fp64_batch_parameters_t& parameters [[buffer(2)]],
+                        device const int* inner_shifts [[buffer(3)]],
                         uint group [[threadgroup_position_in_grid]],
                         uint lane [[thread_index_in_simdgroup]]) {
     int maximum = FP64_ZERO_EXPONENT;
@@ -52,10 +57,17 @@ kernel void find_row_scales(device const fp64_bits_t* input [[buffer(0)]],
     for (uint index = lane; index < parameters.inner; index += 32) {
         ulong offset = ulong(fp64_input_row(parameters, group)) * parameters.inner + index;
         fp64_bits_t bits = input[offset];
-        if (((bits.high >> 20) & 2047u) == 2047u) nonfinite = 1;
+        if (!shifted && ((bits.high >> 20) & 2047u) == 2047u) nonfinite = 1;
         else {
-            maximum = max(maximum, fp64_exponent(bits));
-            minimum = min(minimum, fp64_lowest_bit(bits));
+            int exponent = fp64_exponent(bits), lowest = fp64_lowest_bit(bits);
+            if constexpr (shifted) {
+                if (exponent != FP64_ZERO_EXPONENT) {
+                    exponent += inner_shifts[index];
+                    lowest += inner_shifts[index];
+                }
+            }
+            maximum = max(maximum, exponent);
+            minimum = min(minimum, lowest);
         }
     }
     maximum = simd_max(maximum);
@@ -67,18 +79,26 @@ kernel void find_row_scales(device const fp64_bits_t* input [[buffer(0)]],
     }
 }
 
+template [[host_name("find_row_scales")]] kernel void find_row_scales<false>(device const fp64_bits_t*, device fp64_scale_t*, constant fp64_batch_parameters_t&, device const int*, uint, uint);
+template [[host_name("find_shifted_row_scales")]] kernel void find_row_scales<true>(device const fp64_bits_t*, device fp64_scale_t*, constant fp64_batch_parameters_t&, device const int*, uint, uint);
+
 /**
- * @brief Bの隣接する列を同時に読み、各列の最大値の指数を求める。
+ * @brief 隣接する列を同時に読み、各列の最大値と最下位ビットの指数を求める。
+ * @tparam shifted 内積方向の指数を調整する場合はtrue。
  * @param[in] input FP64のビット列。
  * @param[out] scales 各列の最大値と最下位ビットの指数、非有限値の有無。
  * @param[in] parameters 行列の寸法。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
  * @param[in] group 担当する32列のまとまり。
  * @param[in] lane SIMDグループ内の列位置。
  * @param[in] subgroup 内積方向を分担するSIMDグループの位置。
+ * @pre shiftedがtrueの場合、入力は有限値だけを含むBであること。
  */
+template <bool shifted>
 kernel void find_column_scales(device const fp64_bits_t* input [[buffer(0)]],
                                device fp64_scale_t* scales [[buffer(1)]],
                                constant fp64_batch_parameters_t& parameters [[buffer(2)]],
+                               device const int* inner_shifts [[buffer(3)]],
                                uint group [[threadgroup_position_in_grid]],
                                uint lane [[thread_index_in_simdgroup]],
                                uint subgroup [[simdgroup_index_in_threadgroup]]) {
@@ -92,10 +112,17 @@ kernel void find_column_scales(device const fp64_bits_t* input [[buffer(0)]],
     if (column < parameters.columns) {
         for (uint row = subgroup; row < parameters.inner; row += FP64_COLUMN_SIMD_GROUPS) {
             fp64_bits_t bits = input[ulong(row) * parameters.columns + column];
-            if (((bits.high >> 20) & 2047u) == 2047u) nonfinite = 1;
+            if (!shifted && ((bits.high >> 20) & 2047u) == 2047u) nonfinite = 1;
             else {
-                maximum = max(maximum, fp64_exponent(bits));
-                minimum = min(minimum, fp64_lowest_bit(bits));
+                int exponent = fp64_exponent(bits), lowest = fp64_lowest_bit(bits);
+                if constexpr (shifted) {
+                    if (exponent != FP64_ZERO_EXPONENT) {
+                        exponent -= inner_shifts[row];
+                        lowest -= inner_shifts[row];
+                    }
+                }
+                maximum = max(maximum, exponent);
+                minimum = min(minimum, lowest);
             }
         }
     }
@@ -113,6 +140,33 @@ kernel void find_column_scales(device const fp64_bits_t* input [[buffer(0)]],
         bool zero = maximum == FP64_ZERO_EXPONENT;
         scales[column] = {zero ? 0 : maximum, minimum, nonfinite};
     }
+}
+
+template [[host_name("find_column_scales")]] kernel void find_column_scales<false>(device const fp64_bits_t*, device fp64_scale_t*, constant fp64_batch_parameters_t&, device const int*, uint, uint, uint);
+template [[host_name("find_shifted_column_scales")]] kernel void find_column_scales<true>(device const fp64_bits_t*, device fp64_scale_t*, constant fp64_batch_parameters_t&, device const int*, uint, uint, uint);
+
+/**
+ * @brief 対応するAの列とBの行の最大指数から、積を変えない調整量を求める。
+ * @param[in] a Aの列ごとの解析結果。
+ * @param[in] b Bの行ごとの解析結果。
+ * @param[out] inner_shifts Aへ加え、Bから引く指数。
+ * @param[in] parameters 行列全体の寸法。
+ * @param[in] position 内積方向の要素の二次元の位置。
+ * @pre 入力行列の全要素が有限であること。
+ */
+kernel void find_inner_shifts(device const fp64_scale_t* a [[buffer(0)]],
+                              device const fp64_scale_t* b [[buffer(1)]],
+                              device int* inner_shifts [[buffer(2)]],
+                              constant fp64_batch_parameters_t& parameters [[buffer(3)]],
+                              uint2 position [[thread_position_in_grid]]) {
+    ulong index = ulong(position.y) * min(parameters.inner, 65536u) + position.x;
+    if (index >= parameters.inner) return;
+    int shift = 0;
+    if (a[index].lowest_exponent != 2147483647 && b[index].lowest_exponent != 2147483647) {
+        int difference = b[index].exponent - a[index].exponent;
+        shift = difference / 2 - int(difference < 0 && difference % 2 != 0);
+    }
+    inner_shifts[index] = shift;
 }
 
 /**
@@ -163,13 +217,19 @@ struct fp64_quantized_input_s {
 
 /**
  * @brief FP64の入力を、損失のない整数化に使う仮数と指数へ分解する。
+ * @tparam shifted 内積方向の指数を調整する場合はtrue。
  * @param[in] bits 入力のビット列。
  * @param[in] precision 整数幅。
- * @param[in] scale 行または列の最大値の指数。
+ * @param[in] scale 行または列の最大値の指数から、入力へ加える調整量を差し引いた値。
  * @return 法に依存しない整数化済みの仮数と指数。
  * @pre 入力が有限で、precisionが行または列の全非ゼロビットを保持できること。
  */
+template <bool shifted>
 static inline fp64_quantized_input_s fp64_quantize(fp64_bits_t bits, uint precision, int scale) {
+    if constexpr (shifted) {
+        // ゼロには指数がない。他の要素から求めた調整量を使って、係数表の位置を作らない。
+        if ((bits.low | (bits.high & 0x7fffffffu)) == 0) return {{0, 0}, 0, false};
+    }
     uint raw_exponent = (bits.high >> 20) & 2047u;
     fp64_bits_t mantissa = {bits.low, bits.high & 0xfffffu};
     int exponent = -1074;
@@ -184,20 +244,24 @@ static inline fp64_quantized_input_s fp64_quantize(fp64_bits_t bits, uint precis
 
 /**
  * @brief 入力の各要素からすべての法の余りを生成する。
+ * @tparam shifted 内積方向の指数を調整する場合はtrue。
  * @param[in] input FP64のビット列。
  * @param[in] scales 行または列の指数。
  * @param[out] output 法ごとに連続したINT8の行列。
  * @param[in] parameters 行列の寸法と整数幅。
  * @param[in] plan 使用する法。
  * @param[in] column_mode Bを処理する場合は1、Aを処理する場合は0。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
  * @param[in] position 対象要素の二次元の位置。
  */
+template <bool shifted>
 kernel void make_residues(device const fp64_bits_t* input [[buffer(0)]],
                           device const fp64_scale_t* scales [[buffer(1)]],
                           device int8_t* output [[buffer(2)]],
                           constant fp64_batch_parameters_t& parameters [[buffer(3)]],
                           constant fp64_crt_plan_t& plan [[buffer(4)]],
                           constant uint& column_mode [[buffer(5)]],
+                          device const int* inner_shifts [[buffer(6)]],
                           uint2 position [[thread_position_in_grid]]) {
     ulong count = column_mode ? ulong(parameters.inner) * parameters.columns
                              : ulong(parameters.rows) * parameters.inner;
@@ -208,12 +272,20 @@ kernel void make_residues(device const fp64_bits_t* input [[buffer(0)]],
                                    : ulong(fp64_input_row(parameters, scale_index)) * parameters.inner + index % parameters.inner;
     uint precision = column_mode ? parameters.precision_b : parameters.precision_a;
     if (!column_mode) scale_index = fp64_input_row(parameters, scale_index);
-    auto value = fp64_quantize(input[input_index], precision, scales[scale_index].exponent);
+    int adjustment = 0;
+    if constexpr (shifted) {
+        adjustment = inner_shifts[column_mode ? index / parameters.columns : index % parameters.inner];
+        if (column_mode) adjustment = -adjustment;
+    }
+    auto value = fp64_quantize<shifted>(input[input_index], precision, scales[scale_index].exponent - adjustment);
     for (uint t = 0; t < plan.count; ++t) {
         output[ulong(t) * count + index] = int8_t(fp64_signed_residue(value.mantissa, value.negative,
                                                                    plan.powers[t][value.shift], plan.moduli[t]));
     }
 }
+
+template [[host_name("make_residues")]] kernel void make_residues<false>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, constant uint&, device const int*, uint2);
+template [[host_name("make_shifted_residues")]] kernel void make_residues<true>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, constant uint&, device const int*, uint2);
 
 /**
  * @brief 対称な余り二つの和または差を、同じ範囲へ戻す。
@@ -231,19 +303,22 @@ static inline int8_t fp64_balance(int value, uint modulus) {
 /**
  * @brief 四つの入力ブロックから、Strassen法の七つの演算の入力を生成する。
  * @tparam columns Bのブロックを処理する場合はtrue。
+ * @tparam shifted 内積方向の指数を調整する場合はtrue。
  * @param[in] input FP64のビット列。
  * @param[in] scales 行または列の最大値の指数。
  * @param[out] output 法と演算ごとに並ぶ、ブロックの和と差。
  * @param[in] parameters 行列の寸法。
  * @param[in] plan 使用する法。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
  * @param[in] position ブロック内の二次元の位置。
  */
-template <bool columns>
+template <bool columns, bool shifted>
 kernel void strassen_operands(device const fp64_bits_t* input [[buffer(0)]],
                               device const fp64_scale_t* scales [[buffer(1)]],
                               device int8_t* output [[buffer(2)]],
                               constant fp64_batch_parameters_t& parameters [[buffer(3)]],
                               constant fp64_crt_plan_t& plan [[buffer(4)]],
+                              device const int* inner_shifts [[buffer(5)]],
                               uint2 position [[thread_position_in_grid]]) {
     uint width = columns ? parameters.columns : parameters.inner;
     uint height = columns ? parameters.inner : parameters.rows;
@@ -256,10 +331,23 @@ kernel void strassen_operands(device const fp64_bits_t* input [[buffer(0)]],
     uint first_scale = columns ? column : fp64_input_row(parameters, row);
     uint second_scale = columns ? column + width / 2 : fp64_input_row(parameters, row + height / 2);
     uint precision = columns ? parameters.precision_b : parameters.precision_a;
-    auto first_value = fp64_quantize(input[offset], precision, scales[first_scale].exponent);
-    auto second_value = fp64_quantize(input[offset + width / 2], precision, scales[columns ? second_scale : first_scale].exponent);
-    auto third_value = fp64_quantize(input[lower], precision, scales[columns ? first_scale : second_scale].exponent);
-    auto fourth_value = fp64_quantize(input[lower + width / 2], precision, scales[second_scale].exponent);
+    int first_adjustment = 0, second_adjustment = 0;
+    if constexpr (shifted) {
+        first_adjustment = inner_shifts[columns ? row : column];
+        second_adjustment = inner_shifts[columns ? row + height / 2 : column + width / 2];
+        if constexpr (columns) {
+            first_adjustment = -first_adjustment;
+            second_adjustment = -second_adjustment;
+        }
+    }
+    auto first_value = fp64_quantize<shifted>(input[offset], precision, scales[first_scale].exponent - first_adjustment);
+    auto second_value = fp64_quantize<shifted>(input[offset + width / 2], precision,
+                                             scales[columns ? second_scale : first_scale].exponent
+                                             - (columns ? first_adjustment : second_adjustment));
+    auto third_value = fp64_quantize<shifted>(input[lower], precision,
+                                            scales[columns ? first_scale : second_scale].exponent
+                                            - (columns ? second_adjustment : first_adjustment));
+    auto fourth_value = fp64_quantize<shifted>(input[lower + width / 2], precision, scales[second_scale].exponent - second_adjustment);
     for (uint t = 0; t < plan.count; ++t) {
         device int8_t* destination = output + ulong(t) * 7 * count + index;
         fp64_modulus_t divisor = plan.moduli[t];
@@ -287,8 +375,10 @@ kernel void strassen_operands(device const fp64_bits_t* input [[buffer(0)]],
     }
 }
 
-template [[host_name("strassen_operands_a")]] kernel void strassen_operands<false>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, uint2);
-template [[host_name("strassen_operands_b")]] kernel void strassen_operands<true>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, uint2);
+template [[host_name("strassen_operands_a")]] kernel void strassen_operands<false, false>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, device const int*, uint2);
+template [[host_name("strassen_operands_b")]] kernel void strassen_operands<true, false>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, device const int*, uint2);
+template [[host_name("strassen_shifted_operands_a")]] kernel void strassen_operands<false, true>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, device const int*, uint2);
+template [[host_name("strassen_shifted_operands_b")]] kernel void strassen_operands<true, true>(device const fp64_bits_t*, device const fp64_scale_t*, device int8_t*, constant fp64_batch_parameters_t&, constant fp64_crt_plan_t&, device const int*, uint2);
 
 /**
  * @brief INT8の行列積を計算し、法ごとの余りだけを保存する。
@@ -539,7 +629,7 @@ kernel void floating_matmul(device const fp64_bits_t* a [[buffer(0)]],
                             constant fp64_batch_parameters_t& parameters [[buffer(3)]],
                             uint2 group [[threadgroup_position_in_grid]],
                             uint2 local [[thread_position_in_threadgroup]]) {
-    threadgroup fp64_bits_t tile_a[16 * 32], tile_b[32 * 16];
+    threadgroup fp64_fma_operand_t tile_a[16 * 32], tile_b[32 * 16];
     uint row = group.y * 16 + local.y, column = group.x * 16 + local.x;
     uint thread_index = local.y * 16 + local.x;
     fp64_bits_t sum = {0, 0};
@@ -548,8 +638,8 @@ kernel void floating_matmul(device const fp64_bits_t* a [[buffer(0)]],
         for (uint index = thread_index; index < 512; index += 256) {
             uint ar = group.y * 16 + index / 32, ak = index % 32;
             uint bk = index / 16, bc = group.x * 16 + index % 16;
-            tile_a[index] = ar < parameters.rows && ak < length ? a[ulong(ar) * parameters.inner + begin + ak] : fp64_bits_t{0, 0};
-            tile_b[index] = bc < parameters.columns && bk < length ? b[ulong(begin + bk) * parameters.columns + bc] : fp64_bits_t{0, 0};
+            tile_a[index] = fp64_unpack_operand(ar < parameters.rows && ak < length ? a[ulong(ar) * parameters.inner + begin + ak] : fp64_bits_t{0, 0});
+            tile_b[index] = fp64_unpack_operand(bc < parameters.columns && bk < length ? b[ulong(begin + bk) * parameters.columns + bc] : fp64_bits_t{0, 0});
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint index = 0; index < length; ++index)

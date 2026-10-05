@@ -3,6 +3,26 @@
 
 #include "arithmetic.h"
 
+#define FP64_NONFINITE_SCALE (972) /**< 無限大とNaNの乗数を分解したときの指数。 */
+
+/** @brief 複数の積和演算で再利用する、分解済みのFP64の乗数。 */
+typedef struct fp64_fma_operand_s {
+    fp64_bits_t significand; /**< 非負の仮数と、上位語の最上位ビットに置く符号。 */
+    int scale; /**< 仮数に掛ける2のべき乗の指数。非有限値ではFP64_NONFINITE_SCALE。 */
+} fp64_fma_operand_t;
+
+/**
+ * @brief FP64の乗数を、符号付きの仮数と指数へ分解する。
+ * @param[in] bits FP64のビット列。
+ * @return 積和演算で再利用できる乗数。非有限値では仮数部のビット列を保持する。
+ */
+static inline fp64_fma_operand_t fp64_unpack_operand(fp64_bits_t bits) {
+    fp64_word_t exponent = (bits.high >> 20) & 2047u;
+    fp64_word_t high = bits.high & 0x800fffffu;
+    if (exponent != 0 && exponent != 2047) high |= 0x100000u;
+    return (fp64_fma_operand_t){{bits.low, high}, exponent != 0 ? (int)exponent - 1075 : -1074};
+}
+
 /**
  * @brief FP64の積と加数を揃える128ビットの符号なし整数。
  */
@@ -22,55 +42,6 @@ static inline fp64_word_t fp64_multiply_high(fp64_word_t a, fp64_word_t b) {
 #else
     return (fp64_word_t)(((uint64_t)a * b) >> 32);
 #endif
-}
-
-/**
- * @brief 128ビットの和を求める。
- * @param[in] a 第一の整数。
- * @param[in] b 第二の整数。
- * @return 和。
- * @pre 和が128ビットに収まること。
- */
-static inline fp64_uint128_t fp64_uint128_add(fp64_uint128_t a, fp64_uint128_t b) {
-    fp64_uint128_t result = {0};
-    fp64_word_t carry = 0;
-    for (int i = 0; i < 4; ++i) {
-        fp64_word_t sum = a.words[i] + b.words[i];
-        fp64_word_t value = sum + carry;
-        carry = (sum < a.words[i]) | (value < sum);
-        result.words[i] = value;
-    }
-    return result;
-}
-
-/**
- * @brief 128ビットの大小を比較する。
- * @param[in] a 左辺。
- * @param[in] b 右辺。
- * @return 小さい場合は-1、等しい場合は0、大きい場合は1。
- */
-static inline int fp64_uint128_compare(fp64_uint128_t a, fp64_uint128_t b) {
-    for (int i = 3; i >= 0; --i)
-        if (a.words[i] != b.words[i]) return a.words[i] < b.words[i] ? -1 : 1;
-    return 0;
-}
-
-/**
- * @brief 128ビットの非負の差を求める。
- * @param[in] a 被減数。
- * @param[in] b 減数。
- * @return 差。
- * @pre aがb以上であること。
- */
-static inline fp64_uint128_t fp64_uint128_subtract(fp64_uint128_t a, fp64_uint128_t b) {
-    fp64_uint128_t result = {0};
-    fp64_word_t borrow = 0;
-    for (int i = 0; i < 4; ++i) {
-        fp64_word_t difference = a.words[i] - b.words[i];
-        result.words[i] = difference - borrow;
-        borrow = (a.words[i] < b.words[i]) | (difference < borrow);
-    }
-    return result;
 }
 
 /**
@@ -131,12 +102,12 @@ static inline fp64_uint128_t fp64_uint128_align(fp64_uint128_t value, int shift)
  * @param[in] value 絶対値の整数。
  * @param[in] negative 符号。
  * @param[in] scale 2のべき乗の指数。
- * @return FP64のビット列。
+ * @return FP64のビット列。整数がゼロの場合は正のゼロ。
  */
 static inline fp64_bits_t fp64_uint128_pack(fp64_uint128_t value, bool negative, int scale) {
     fp64_word_t length = fp64_uint128_length(value);
     fp64_word_t sign = negative ? 0x80000000u : 0;
-    if (length == 0) return (fp64_bits_t){0, sign};
+    if (length == 0) return (fp64_bits_t){0, 0};
     int exponent = (int)length - 1 + scale;
     if (exponent > 1023) return (fp64_bits_t){0, sign | 0x7ff00000u};
     bool subnormal = exponent < -1022;
@@ -148,10 +119,10 @@ static inline fp64_bits_t fp64_uint128_pack(fp64_uint128_t value, bool negative,
         // 丸め位置の直下に2ビットを残す。上側が中間値のビットで、下側には失われた非ゼロの情報を含める。
         fp64_uint128_t rounded = fp64_uint128_align(value, 2 - shift);
         mantissa = (fp64_bits_t){(rounded.words[0] >> 2) | (rounded.words[1] << 30), rounded.words[1] >> 2};
-        if ((rounded.words[0] & 2u) && ((rounded.words[0] & 1u) || (mantissa.low & 1u))) {
-            ++mantissa.low;
-            if (mantissa.low == 0) ++mantissa.high;
-        }
+        fp64_word_t increment = ((rounded.words[0] >> 1) & 1u) & ((rounded.words[0] | mantissa.low) & 1u);
+        fp64_word_t low = mantissa.low + increment;
+        mantissa.high += low < mantissa.low;
+        mantissa.low = low;
     }
     if (subnormal) return (fp64_bits_t){mantissa.low, sign | mantissa.high};
     if (mantissa.high & 0x200000u) {
@@ -184,25 +155,29 @@ static inline fp64_uint128_t fp64_multiply_significands(fp64_bits_t a, fp64_bits
 
 /**
  * @brief FP64の積と加算を合わせて最近接偶数丸めする。
- * @param[in] a 第一の乗数のビット列。
- * @param[in] b 第二の乗数のビット列。
+ * @param[in] a 分解済みの第一の乗数。
+ * @param[in] b 分解済みの第二の乗数。
  * @param[in] c 加数のビット列。
  * @param[in] finite_inputs 両乗数が有限であることが確定している場合はtrue。
  * @return README.md「計算の定義」に従うFP64のビット列。
+ * @pre aとbはfp64_unpack_operandで分解した値であること。
  * @pre finite_inputsがtrueの場合、aとbは有限であること。
  * @note CPUの浮動小数点演算と例外フラグを使用しない。
  */
-static inline fp64_bits_t fp64_fused_multiply_add(fp64_bits_t a, fp64_bits_t b, fp64_bits_t c, bool finite_inputs) {
-    fp64_word_t ea = (a.high >> 20) & 2047u, eb = (b.high >> 20) & 2047u, ec = (c.high >> 20) & 2047u;
-    fp64_bits_t ma = {a.low, a.high & 0xfffffu}, mb = {b.low, b.high & 0xfffffu}, mc = {c.low, c.high & 0xfffffu};
-    bool product_negative = ((a.high ^ b.high) >> 31) != 0, c_negative = (c.high >> 31) != 0;
-    bool za = ea == 0 && (ma.low | ma.high) == 0, zb = eb == 0 && (mb.low | mb.high) == 0;
+static inline fp64_bits_t fp64_fused_multiply_add(fp64_fma_operand_t a, fp64_fma_operand_t b, fp64_bits_t c, bool finite_inputs) {
+    fp64_word_t ec = (c.high >> 20) & 2047u;
+    fp64_bits_t ma = {a.significand.low, a.significand.high & 0x1fffffu};
+    fp64_bits_t mb = {b.significand.low, b.significand.high & 0x1fffffu}, mc = {c.low, c.high & 0xfffffu};
+    bool product_negative = ((a.significand.high ^ b.significand.high) >> 31) != 0, c_negative = (c.high >> 31) != 0;
+    bool za = (ma.low | ma.high) == 0, zb = (mb.low | mb.high) == 0;
     fp64_bits_t nan = {0, 0x7ff80000u};
     if (ec == 2047 && (mc.low | mc.high) != 0) return nan;
     if (!finite_inputs) {
-        if ((ea == 2047 && (ma.low | ma.high) != 0) || (eb == 2047 && (mb.low | mb.high) != 0)) return nan;
-        if (ea == 2047 || eb == 2047) {
-            if (za || zb || (ec == 2047 && product_negative != c_negative)) return nan;
+        if ((a.scale == FP64_NONFINITE_SCALE && (ma.low | ma.high) != 0)
+            || (b.scale == FP64_NONFINITE_SCALE && (mb.low | mb.high) != 0)) return nan;
+        if (a.scale == FP64_NONFINITE_SCALE || b.scale == FP64_NONFINITE_SCALE) {
+            if ((za && a.scale != FP64_NONFINITE_SCALE) || (zb && b.scale != FP64_NONFINITE_SCALE)
+                || (ec == 2047 && product_negative != c_negative)) return nan;
             return (fp64_bits_t){0, (product_negative ? 0x80000000u : 0) | 0x7ff00000u};
         }
     }
@@ -212,10 +187,8 @@ static inline fp64_bits_t fp64_fused_multiply_add(fp64_bits_t a, fp64_bits_t b, 
             return (fp64_bits_t){0, product_negative && c_negative ? 0x80000000u : 0};
         return c;
     }
-    if (ea != 0) ma.high |= 0x100000u;
-    if (eb != 0) mb.high |= 0x100000u;
     if (ec != 0) mc.high |= 0x100000u;
-    int product_scale = (ea != 0 ? (int)ea - 1075 : -1074) + (eb != 0 ? (int)eb - 1075 : -1074);
+    int product_scale = a.scale + b.scale;
     int c_scale = ec != 0 ? (int)ec - 1075 : -1074;
     fp64_uint128_t product = fp64_multiply_significands(ma, mb), addend = {{mc.low, mc.high, 0, 0}};
     fp64_word_t product_length = fp64_uint128_length(product), c_length = fp64_uint128_length(addend);
@@ -226,12 +199,33 @@ static inline fp64_bits_t fp64_fused_multiply_add(fp64_bits_t a, fp64_bits_t b, 
     // 範囲外へずらす場合は、最下位ビットに集めた情報だけで最終丸めの方向を決められる。
     product = fp64_uint128_align(product, product_scale - scale);
     addend = fp64_uint128_align(addend, c_scale - scale);
-    if (product_negative == c_negative)
-        return fp64_uint128_pack(fp64_uint128_add(product, addend), product_negative, scale);
-    int order = fp64_uint128_compare(product, addend);
-    if (order == 0) return (fp64_bits_t){0, 0};
-    return fp64_uint128_pack(order > 0 ? fp64_uint128_subtract(product, addend) : fp64_uint128_subtract(addend, product),
-                             order > 0 ? product_negative : c_negative, scale);
+    fp64_uint128_t magnitude;
+    bool negative = product_negative;
+    if (product_negative == c_negative) {
+        fp64_word_t carry = 0;
+        for (int i = 0; i < 4; ++i) {
+            fp64_word_t sum = product.words[i] + addend.words[i];
+            magnitude.words[i] = sum + carry;
+            carry = (sum < product.words[i]) | (magnitude.words[i] < sum);
+        }
+    } else {
+        fp64_word_t borrow = 0;
+        for (int i = 0; i < 4; ++i) {
+            fp64_word_t difference = product.words[i] - addend.words[i];
+            magnitude.words[i] = difference - borrow;
+            borrow = (product.words[i] < addend.words[i]) | (difference < borrow);
+        }
+        // 最上位からの借りを、符号と二の補数からの絶対値化に使う。
+        // マスクがゼロの場合も同じ命令列を使い、SIMD内で符号が異なる場合の分岐を避ける。
+        negative = negative != (borrow != 0);
+        fp64_word_t mask = 0u - borrow, carry = borrow;
+        for (int i = 0; i < 4; ++i) {
+            fp64_word_t inverted = magnitude.words[i] ^ mask;
+            magnitude.words[i] = inverted + carry;
+            carry = magnitude.words[i] < inverted;
+        }
+    }
+    return fp64_uint128_pack(magnitude, negative, scale);
 }
 
 #endif

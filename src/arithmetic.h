@@ -143,6 +143,7 @@ typedef struct fp64_batch_parameters_s {
     fp64_word_t precision_b; /**< Bの整数幅。 */
     fp64_word_t total_rows; /**< 入力Aの行数。上下のブロックの対応に使う。 */
     fp64_word_t strassen; /**< Strassen法でブロックを処理する場合は1、それ以外は0。 */
+    fp64_word_t shifted; /**< 内積方向の指数を調整する場合は1、それ以外は0。 */
 } fp64_batch_parameters_t;
 
 /**

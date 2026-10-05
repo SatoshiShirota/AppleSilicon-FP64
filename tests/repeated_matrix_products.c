@@ -53,11 +53,12 @@ static bool fp64_check_product(apple_fp64_multiplier_t *multiplier, uint32_t m, 
 /**
  * @brief 行と列の係数を持つ大きな長方形の積を、厳密な整数の期待値と比較する。
  * @param[in,out] multiplier 積を実行する計算器。
+ * @param[in] wide_exponents 内積方向に逆向きの指数を掛け、入力の範囲を広げる場合はtrue。
  * @return 全出力のビット列が一致した場合はtrue。
  * @note 行のまとまりに奇数を指定し、符号と指数が異なる行と列を含める。
  * @note 上下と左右のブロックで、整数化した値の下位ゼロビット数を変える。
  */
-static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier)
+static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier, bool wide_exponents)
 {
     const uint32_t m = 1026, n = 1152, k = 2048;
     size_t a_count = (size_t)m * k, b_count = (size_t)k * n;
@@ -70,16 +71,17 @@ static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier)
     int64_t inner_sum = 0;
     for (uint32_t inner = 0; inner < k; ++inner) {
         int first = (int)(inner % 11) - 5, second = (int)(inner % 13) - 6;
+        int exponent = wide_exponents ? ((int)(inner % 5) - 2) * 400 : 0;
         inner_sum += first * second;
         for (uint32_t row = 0; row < m; ++row) {
             int factor = (int)(row % 7) - 3;
             if (row >= m / 2 && row < m / 2 + 128) factor += 8;
-            a[(size_t)row * k + inner] = factor * first;
+            a[(size_t)row * k + inner] = ldexp(factor * first, exponent);
         }
         for (uint32_t column = 0; column < n; ++column) {
             int factor = (int)(column % 17) - 8;
             if (column >= n / 2 && column < n / 2 + 64) factor += 16;
-            b[(size_t)inner * n + column] = second * factor;
+            b[(size_t)inner * n + column] = ldexp(second * factor, -exponent);
         }
     }
     apple_fp64_result_t result = {0};
@@ -114,9 +116,12 @@ static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier)
  */
 static bool fp64_check_input_ranges(apple_fp64_multiplier_t *multiplier)
 {
-    const double a[][2] = {{1, 0}, {DBL_MAX, 0x1p-1074}, {INFINITY, 1}, {1, -1}, {1, 0x1p-80}};
-    const double b[][2] = {{1, 1}, {0, 1}, {0, 1}, {1, 1}, {0, 0x1p80}};
-    const uint64_t expected[] = {UINT64_C(0x3ff0000000000000), UINT64_C(1),
+    const double a[][2] = {{1, 0}, {0x1p500, 0x1p-500}, {1 + 0x1p-27, 0x1p-200},
+                           {DBL_MAX, 0x1p-1074}, {INFINITY, 1}, {1, -1}, {1, 0x1p-80}};
+    const double b[][2] = {{1, 1}, {0x1p-500, 0x1p500}, {1 - 0x1p-27, -0x1p-200},
+                           {0, 1}, {0, 1}, {1, 1}, {0, 0x1p80}};
+    const uint64_t expected[] = {UINT64_C(0x3ff0000000000000), UINT64_C(0x4000000000000000),
+                                 UINT64_C(0x3ff0000000000000), UINT64_C(1),
                                  UINT64_C(0x7ff8000000000000), UINT64_C(0), UINT64_C(0x3ff0000000000000)};
     for (size_t index = 0; index < sizeof(expected) / sizeof(expected[0]); ++index) {
         apple_fp64_result_t result = {0};
@@ -208,7 +213,8 @@ int main(int argc, char **argv)
                 && fp64_check_product(multiplier, 33, 65, 7, 0, 4, (apple_fp64_options_t){11})
                 && fp64_check_unreadable_library(argv[1])
                 && fp64_check_input_ranges(multiplier)
-                && fp64_check_factored_product(multiplier)
+                && fp64_check_factored_product(multiplier, false)
+                && fp64_check_factored_product(multiplier, true)
                 && fp64_check_product(multiplier, 9, 3, 11, 2, -0.5, (apple_fp64_options_t){2})
                 && strcmp(device_name, apple_fp64_device_name(multiplier)) == 0;
     apple_fp64_multiplier_destroy(multiplier);
