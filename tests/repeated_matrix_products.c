@@ -10,27 +10,27 @@
 
 /**
  * @~japanese
- * @brief 一定値の行列について、同じ計算器による積の全ビットを検証する。
- * @param[in,out] multiplier 積を実行する計算器。
- * @param[in] m 出力の行数。
- * @param[in] n 出力の列数。
+ * @brief すべての要素が同じ値である行列AとBについて、計算器による積の全ビットが期待値と一致するか検証する。
+ * @param[in,out] multiplier 行列積を実行する計算器。
+ * @param[in] m 出力行列の行数。
+ * @param[in] n 出力行列の列数。
  * @param[in] k 内積の項数。
- * @param[in] a_value Aの全要素の値。
- * @param[in] b_value Bの全要素の値。
- * @param[in] options 行のまとまりの大きさ。
- * @return 出力の長さと値が一致した場合はtrue。
- * @pre 入力の整数化と期待値の算出に丸めが発生しない値を指定すること。
+ * @param[in] a_value 行列Aの全要素に入れる値。
+ * @param[in] b_value 行列Bの全要素に入れる値。
+ * @param[in] options 行のバッチサイズなどの計算設定。
+ * @return 出力の要素数とすべてのビット列が期待値と一致した場合はtrue。
+ * @pre 入力の整数化と期待値の計算で丸め誤差が生じない値を指定すること。
  * @~english
- * @brief Verify every output bit of constant-valued matrix products using the same multiplier.
- * @param[in,out] multiplier Multiplier computing the product.
+ * @brief Verify that every output bit of the product of constant-valued matrices A and B matches the expected value.
+ * @param[in,out] multiplier Multiplier computing the matrix product.
  * @param[in] m Number of output rows.
  * @param[in] n Number of output columns.
  * @param[in] k Number of terms in each dot product.
- * @param[in] a_value Value of every element in A.
- * @param[in] b_value Value of every element in B.
- * @param[in] options Row batch size.
- * @return true if the output length and values match.
- * @pre Input integer conversion and expected-value calculation must not require rounding.
+ * @param[in] a_value Value assigned to every element of matrix A.
+ * @param[in] b_value Value assigned to every element of matrix B.
+ * @param[in] options Computation options including the row batch size.
+ * @return true if the output element count and all bit patterns match the expected values.
+ * @pre Values must be chosen so that integer conversion and expected-value calculation incur no rounding error.
  * @~
  */
 static bool fp64_check_product(apple_fp64_multiplier_t *multiplier, uint32_t m, uint32_t n,
@@ -65,22 +65,19 @@ static bool fp64_check_product(apple_fp64_multiplier_t *multiplier, uint32_t m, 
 
 /**
  * @~japanese
- * @brief 行と列の係数を持つ大きな長方形の積を、厳密な整数の期待値と比較する。
- * @param[in,out] multiplier 積を実行する計算器。
- * @param[in] wide_exponents 内積方向に逆向きの指数を掛け、入力の範囲を広げる場合はtrue。
- * @return 全出力のビット列が一致した場合はtrue。
- * @note 行のまとまりに奇数を指定し、符号と指数が異なる行と列を含める。
- * @note 上下と左右のブロックで、整数化した値の下位ゼロビット数を変える。
+ * @brief 行ごとおよび列ごとの係数を持つ大きな長方形の行列積を計算し、厳密な整数の期待値と一致するか検証する。
+ * @param[in,out] multiplier 行列積を実行する計算器。
+ * @param[in] wide_exponents 内積の方向に逆向きの指数スケーリングを与えて、入力の指数範囲を広げる場合はtrue。
+ * @return すべての出力要素のビット列が期待値と一致した場合はtrue。
+ * @note 奇数のバッチサイズ（255）を指定し、符号や指数が異なる行と列を混在させる。
+ * @note 行と列の中央付近のブロックで係数を変え、整数化した値の下位ゼロビット数がブロックごとに異なるようにする。
  * @~english
- * @brief Compare a large rectangular product with row and column coefficients against exact integer
- * expectations.
- * @param[in,out] multiplier Multiplier computing the product.
- * @param[in] wide_exponents true when applying opposite exponents along the inner dimension to widen the
- * input range.
- * @return true if every output bit pattern matches.
- * @note Use an odd row batch size and include rows and columns with different signs and exponents.
- * @note Vary the number of trailing zero bits in integer-converted values between the top, bottom, left, and
- * right blocks.
+ * @brief Compute a large rectangular matrix product with row-wise and column-wise factors and verify it against exact integer expectations.
+ * @param[in,out] multiplier Multiplier computing the matrix product.
+ * @param[in] wide_exponents true to apply opposite exponent scaling along the inner dimension and widen the input exponent range.
+ * @return true if the bit pattern of every output element matches the expected value.
+ * @note Uses an odd row batch size (255) and mixes rows and columns with varying signs and exponents.
+ * @note Adjusts factors in central row and column blocks so that the trailing-zero bit counts of integer-scaled values vary across blocks.
  * @~
  */
 static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier, bool wide_exponents)
@@ -136,14 +133,13 @@ static bool fp64_check_factored_product(apple_fp64_multiplier_t *multiplier, boo
 
 /**
  * @~japanese
- * @brief 同じ寸法で入力の指数範囲と特殊値を変え、計算器を再利用する。
- * @param[in,out] multiplier 積を実行する計算器。
- * @return 各入力の数値結果が一致した場合はtrue。
+ * @brief 同じ行列寸法のまま入力の指数範囲や特殊値（無限大など）を切り替え、同じ計算器を繰り返し使用できるか検証する。
+ * @param[in,out] multiplier 行列積を実行する計算器。
+ * @return すべての入力パターンで計算結果が期待値と一致した場合はtrue。
  * @~english
- * @brief Reuse the multiplier with the same dimensions while varying input exponent ranges and special
- * values.
- * @param[in,out] multiplier Multiplier computing the product.
- * @return true if the numerical results match for each input.
+ * @brief Verify that the same multiplier can be reused across inputs with fixed dimensions but varying exponent ranges and special values.
+ * @param[in,out] multiplier Multiplier computing the matrix product.
+ * @return true if the computed result matches the expected value for every input pattern.
  * @~
  */
 static bool fp64_check_input_ranges(apple_fp64_multiplier_t *multiplier)
@@ -171,13 +167,13 @@ static bool fp64_check_input_ranges(apple_fp64_multiplier_t *multiplier)
 
 /**
  * @~japanese
- * @brief 入力の長さが不正な場合、所有する出力を返さずに診断を返すことを検証する。
- * @param[in,out] multiplier 積を実行する計算器。
- * @return 定義された失敗を返した場合はtrue。
+ * @brief 入力配列の要素数が不正なとき、出力のメモリーを確保せずにエラー情報を返すことを検証する。
+ * @param[in,out] multiplier 行列積を実行する計算器。
+ * @return 仕様どおりのエラーと空の出力が返された場合はtrue。
  * @~english
- * @brief Verify that invalid input lengths produce a diagnostic without returning owned output.
- * @param[in,out] multiplier Multiplier computing the product.
- * @return true if the defined failure is returned.
+ * @brief Verify that an invalid input element count returns an error diagnostic without allocating output memory.
+ * @param[in,out] multiplier Multiplier computing the matrix product.
+ * @return true if the specified error status and empty output are returned.
  * @~
  */
 static bool fp64_check_rejected_length(apple_fp64_multiplier_t *multiplier)
@@ -200,13 +196,13 @@ static bool fp64_check_rejected_length(apple_fp64_multiplier_t *multiplier)
 
 /**
  * @~japanese
- * @brief 読めないMetalライブラリーについて、計算器を返さずに診断を返すことを検証する。
- * @param[in] library_path コンパイル済みライブラリーのパス。
- * @return 定義された失敗を返した場合はtrue。
+ * @brief 読み込めないMetalライブラリーのパスを渡したとき、計算器を作成せずにエラー情報を返すことを検証する。
+ * @param[in] library_path コンパイル済みMetalライブラリーのパス。
+ * @return 仕様どおりのエラーとNULLの計算器が返された場合はtrue。
  * @~english
- * @brief Verify that an unreadable Metal library produces a diagnostic without returning a multiplier.
- * @param[in] library_path Path to the compiled library.
- * @return true if the defined failure is returned.
+ * @brief Verify that passing an unreadable Metal library path returns an error diagnostic without creating a multiplier.
+ * @param[in] library_path Path to the compiled Metal library.
+ * @return true if the specified error status and a NULL multiplier are returned.
  * @~
  */
 static bool fp64_check_unreadable_library(const char *library_path)
@@ -229,16 +225,16 @@ static bool fp64_check_unreadable_library(const char *library_path)
 
 /**
  * @~japanese
- * @brief 寸法と入力を変え、同じ計算器を繰り返し使う。
+ * @brief 行列の寸法や入力の性質を変えながら同じ計算器を繰り返し呼び出し、計算結果とエラー時の動作を検証する。
  * @param[in] argc 引数の個数。
- * @param[in] argv Metalライブラリーのパスを含む引数。
- * @return すべての積と失敗動作が一致した場合は0。
+ * @param[in] argv Metalライブラリーのパスを含むコマンドライン引数。
+ * @return すべての検証に成功した場合は0、それ以外は1。
  * @pre argcは2であること。
  * @~english
- * @brief Use the same multiplier repeatedly with different dimensions and inputs.
+ * @brief Repeatedly invoke the same multiplier across varying matrix dimensions and input characteristics to verify results and error behavior.
  * @param[in] argc Number of arguments.
- * @param[in] argv Arguments including the Metal library path.
- * @return Zero if every product and failure behavior matches.
+ * @param[in] argv Command-line arguments including the Metal library path.
+ * @return Zero if all verifications succeed, otherwise one.
  * @pre argc must be 2.
  * @~
  */

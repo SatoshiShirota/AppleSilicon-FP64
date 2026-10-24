@@ -5,11 +5,11 @@
 
 /**
  * @~japanese
- * @brief 単調な時計の時刻を返す。
- * @return 起点からの経過秒数。
+ * @brief 単調増加クロック（CLOCK_MONOTONIC）から現在時刻を取得する。
+ * @return クロックの起点からの経過秒数。
  * @~english
- * @brief Return the time from a monotonic clock.
- * @return Elapsed seconds from the clock origin.
+ * @brief Read the current time from the monotonic clock (CLOCK_MONOTONIC).
+ * @return Elapsed seconds since the clock origin.
  * @~
  */
 static inline double fp64_monotonic_seconds(void)

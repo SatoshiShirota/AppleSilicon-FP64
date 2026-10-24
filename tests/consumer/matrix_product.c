@@ -3,15 +3,15 @@
 
 /**
  * @~japanese
- * @brief 外部プロジェクトから公開ヘッダーとライブラリーを使い、行列積を検証する。
+ * @brief 外部のCMakeプロジェクトから公開ヘッダーとライブラリーをリンクし、行列積が正しく計算できるか検証する。
  * @param[in] argc 引数の個数。
- * @param[in] argv 配布されたMetalライブラリーのパスを含む引数。
- * @return 行列積と期待値が一致した場合は0、それ以外の場合は1。
+ * @param[in] argv 配布されたMetalライブラリーのパスを含むコマンドライン引数。
+ * @return 計算結果が期待値と一致した場合は0、それ以外は1。
  * @~english
- * @brief Verify matrix multiplication using the public header and library from an external project.
+ * @brief Link the public header and library from an external CMake project and verify matrix multiplication.
  * @param[in] argc Number of arguments.
- * @param[in] argv Arguments including the distributed Metal library path.
- * @return Zero if the matrix product matches the expected values, otherwise one.
+ * @param[in] argv Command-line arguments including the distributed Metal library path.
+ * @return Zero if the computed product matches the expected values, otherwise one.
  * @~
  */
 int main(int argc, char **argv)

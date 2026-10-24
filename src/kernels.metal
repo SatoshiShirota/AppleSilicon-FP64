@@ -8,32 +8,34 @@ using namespace mpp::tensor_ops;
 
 /**
  * @~japanese
- * @brief 行のまとまりの位置を、入力Aの行へ対応させる。
- * @param[in] parameters 行列の寸法と処理するブロック。
- * @param[in] row 行のまとまりの中の位置。
- * @return 入力Aにおける行の位置。
+ * @brief 行のまとまり内の行番号を、入力行列Aにおける行番号へ変換する。
+ * @param[in] parameters 行列の寸法と現在処理している行のまとまりの情報。
+ * @param[in] row 行のまとまり内の行番号（0始まり）。
+ * @return 入力行列Aにおける行番号。
  * @~english
- * @brief Map a position within a row batch to a row of input A.
- * @param[in] parameters Matrix dimensions and the block being processed.
- * @param[in] row Position within the row batch.
- * @return Row position in input A.
+ * @brief Map a row index within the current row batch to a row index in input matrix A.
+ * @param[in] parameters Matrix dimensions and current row-batch parameters.
+ * @param[in] row Zero-based row index within the row batch.
+ * @return Row index in input matrix A.
  * @~
  */
 static inline uint fp64_input_row(constant fp64_batch_parameters_t& parameters, uint row) {
     if (!parameters.strassen) return parameters.row_begin + row;
+    // Strassen法では、行のまとまりの前半に入力Aの上半分の行を、後半に下半分の対応する行を割り当てる。
     uint half_rows = parameters.rows / 2;
     return parameters.row_begin + (row < half_rows ? row : row - half_rows + parameters.total_rows / 2);
 }
 
 /**
  * @~japanese
- * @brief FP64の絶対値に含まれる、最下位の非ゼロのビットの指数を求める。
- * @param[in] bits 有限のFP64のビット列。
- * @return 非ゼロ値ではビットの指数。ゼロでは符号付き32ビット整数の最大値。
+ * @brief 有限のFP64値の絶対値において、最下位の非ゼロビットが位置する2のべき乗の指数を求める。
+ * @param[in] bits 有限のFP64値のビット列。
+ * @return 非ゼロ値の場合は最下位非ゼロビットの指数、ゼロの場合はINT_MAX（2147483647）。
  * @~english
- * @brief Compute the exponent of the least significant nonzero bit in an FP64 magnitude.
+ * @brief Compute the base-2 exponent of the least significant nonzero bit in the magnitude of a finite FP64
+ * value.
  * @param[in] bits Bit pattern of a finite FP64 value.
- * @return Bit exponent for a nonzero value. Maximum signed 32-bit integer for zero.
+ * @return Exponent of the least significant nonzero bit for a nonzero value, or INT_MAX (2147483647) for zero.
  * @~
  */
 static inline int fp64_lowest_bit(fp64_bits_t bits) {
@@ -41,6 +43,7 @@ static inline int fp64_lowest_bit(fp64_bits_t bits) {
     uint high = bits.high & 0xfffffu;
     if (exponent != 0) high |= 0x100000u;
     int scale = exponent != 0 ? int(exponent) - 1075 : -1074;
+    // x & (0u - x) で最下位の1のビットだけを取り出し、そのビット位置から2のべき乗の指数を求める。
     if (bits.low != 0) return scale + int(fp64_word_bit_length(bits.low & (0u - bits.low))) - 1;
     if (high != 0) return scale + 32 + int(fp64_word_bit_length(high & (0u - high))) - 1;
     return 2147483647;
@@ -48,26 +51,27 @@ static inline int fp64_lowest_bit(fp64_bits_t bits) {
 
 /**
  * @~japanese
- * @brief 行に含まれる最大値と最下位ビットの指数を求める。
- * @tparam shifted 内積方向の指数を調整する場合はtrue。
- * @param[in] input FP64のビット列。
- * @param[out] scales 各行の最大値と最下位ビットの指数、非有限値の有無。
+ * @brief 行列の各行を走査し、最大値を囲む指数、最下位の非ゼロビットの最小指数、および非有限値の有無を求める。
+ * @tparam shifted 内積方向の指数の調整量を適用する場合はtrue。
+ * @param[in] input 行優先で並ぶFP64のビット列。
+ * @param[out] scales 各行の最大値を囲む指数、最下位ビットの最小指数、および非有限値の有無の出力先。
  * @param[in] parameters 行列の寸法。
- * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
- * @param[in] group 担当する行。
- * @param[in] lane SIMDグループ内のスレッド位置。
- * @pre shiftedがtrueの場合、入力は有限値だけを含むAであること。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ参照する。
+ * @param[in] group 担当する行番号。
+ * @param[in] lane SIMDグループ内のスレッド番号（0～31）。
+ * @pre shiftedがtrueの場合、inputは有限値だけを含む行列Aであること。
  * @~english
- * @brief Compute the exponents of the maximum value and least significant bit in each row.
- * @tparam shifted true when adjusting exponents along the inner dimension.
- * @param[in] input FP64 bit patterns.
- * @param[out] scales Exponents of the maximum value and least significant bit in each row, and presence of
- * nonfinite values.
+ * @brief Scan each row of a matrix to find the exponent bounding the maximum magnitude, the minimum exponent of
+ * the least significant nonzero bit, and whether any nonfinite value is present.
+ * @tparam shifted true when applying inner-dimension exponent adjustments.
+ * @param[in] input Row-major FP64 bit patterns.
+ * @param[out] scales Per-row output storing the bounding exponent, minimum least-significant-bit exponent, and
+ * nonfinite flag.
  * @param[in] parameters Matrix dimensions.
- * @param[in] inner_shifts Exponent adjustments along the inner dimension. Used only when shifted is true.
- * @param[in] group Assigned row.
- * @param[in] lane Thread position within the SIMD group.
- * @pre When shifted is true, the input must be A and contain only finite values.
+ * @param[in] inner_shifts Inner-dimension exponent adjustments, read only when shifted is true.
+ * @param[in] group Assigned row index.
+ * @param[in] lane Thread index within the SIMD group (0 to 31).
+ * @pre When shifted is true, input must be matrix A and contain only finite values.
  * @~
  */
 template <bool shifted>
@@ -110,29 +114,29 @@ template [[host_name("find_shifted_row_scales")]] kernel void find_row_scales<tr
 
 /**
  * @~japanese
- * @brief 隣接する列を同時に読み、各列の最大値と最下位ビットの指数を求める。
- * @tparam shifted 内積方向の指数を調整する場合はtrue。
- * @param[in] input FP64のビット列。
- * @param[out] scales 各列の最大値と最下位ビットの指数、非有限値の有無。
+ * @brief 隣接する32列をまとめて走査し、各列における最大値を囲む指数、最下位の非ゼロビットの最小指数、および非有限値の有無を求める。
+ * @tparam shifted 内積方向の指数の調整量を適用する場合はtrue。
+ * @param[in] input 行優先で並ぶFP64のビット列。
+ * @param[out] scales 各列の最大値を囲む指数、最下位ビットの最小指数、および非有限値の有無の出力先。
  * @param[in] parameters 行列の寸法。
- * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
- * @param[in] group 担当する32列のまとまり。
- * @param[in] lane SIMDグループ内の列位置。
- * @param[in] subgroup 内積方向を分担するSIMDグループの位置。
- * @pre shiftedがtrueの場合、入力は有限値だけを含むBであること。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ参照する。
+ * @param[in] group 担当する32列のまとまりの番号。
+ * @param[in] lane SIMDグループ内のスレッド番号（0～31、担当する列のオフセットに対応する）。
+ * @param[in] subgroup 内積方向の走査を分担するSIMDグループの番号。
+ * @pre shiftedがtrueの場合、inputは有限値だけを含む行列Bであること。
  * @~english
- * @brief Read adjacent columns together and compute the exponents of their maximum values and least
- * significant bits.
- * @tparam shifted true when adjusting exponents along the inner dimension.
- * @param[in] input FP64 bit patterns.
- * @param[out] scales Exponents of the maximum value and least significant bit in each column, and presence of
- * nonfinite values.
+ * @brief Scan batches of 32 adjacent columns in parallel to find each column's bounding exponent, minimum
+ * least-significant-bit exponent, and whether any nonfinite value is present.
+ * @tparam shifted true when applying inner-dimension exponent adjustments.
+ * @param[in] input Row-major FP64 bit patterns.
+ * @param[out] scales Per-column output storing the bounding exponent, minimum least-significant-bit exponent,
+ * and nonfinite flag.
  * @param[in] parameters Matrix dimensions.
- * @param[in] inner_shifts Exponent adjustments along the inner dimension. Used only when shifted is true.
- * @param[in] group Assigned batch of 32 columns.
- * @param[in] lane Column position within the SIMD group.
- * @param[in] subgroup Position of the SIMD group sharing work along the inner dimension.
- * @pre When shifted is true, the input must be B and contain only finite values.
+ * @param[in] inner_shifts Inner-dimension exponent adjustments, read only when shifted is true.
+ * @param[in] group Index of the assigned 32-column batch.
+ * @param[in] lane Thread index within the SIMD group (0 to 31, corresponding to the column offset).
+ * @param[in] subgroup Index of the SIMD group sharing the scan along the inner dimension.
+ * @pre When shifted is true, input must be matrix B and contain only finite values.
  * @~
  */
 template <bool shifted>
@@ -188,22 +192,22 @@ template [[host_name("find_shifted_column_scales")]] kernel void find_column_sca
 
 /**
  * @~japanese
- * @brief 対応するAの列とBの行の最大指数から、積を変えない調整量を求める。
- * @param[in] a Aの列ごとの解析結果。
- * @param[in] b Bの行ごとの解析結果。
- * @param[out] inner_shifts Aへ加え、Bから引く指数。
+ * @brief 行列Aの各列と行列Bの対応する各行の最大指数から、積A_{ik} * B_{kj}を変えずに指数差を縮める調整量を求める。
+ * @param[in] a 行列Aの列ごとの解析結果。
+ * @param[in] b 行列Bの行ごとの解析結果。
+ * @param[out] inner_shifts 行列Aの第k列へ加算し、行列Bの第k行から減算する指数の調整量。
  * @param[in] parameters 行列全体の寸法。
- * @param[in] position 内積方向の要素の二次元の位置。
- * @pre 入力行列の全要素が有限であること。
+ * @param[in] position 内積方向の添字kに対応する2次元グリッド上のスレッド位置。
+ * @pre 入力行列AとBのすべての要素が有限値であること。
  * @~english
- * @brief Compute product-preserving adjustments from the maximum exponents of corresponding columns of A and
- * rows of B.
- * @param[in] a Analysis of each column of A.
- * @param[in] b Analysis of each row of B.
- * @param[out] inner_shifts Exponent added to A and subtracted from B.
- * @param[in] parameters Dimensions of the entire matrix.
- * @param[in] position Two-dimensional element position along the inner dimension.
- * @pre All elements of the input matrices must be finite.
+ * @brief Compute product-preserving exponent adjustments from the maximum exponents of each column of A and the
+ * corresponding row of B.
+ * @param[in] a Per-column analysis of matrix A.
+ * @param[in] b Per-row analysis of matrix B.
+ * @param[out] inner_shifts Exponent adjustment added to column k of A and subtracted from row k of B.
+ * @param[in] parameters Dimensions of the full matrices.
+ * @param[in] position Two-dimensional thread position corresponding to inner-dimension index k.
+ * @pre All elements of input matrices A and B must be finite.
  * @~
  */
 kernel void find_inner_shifts(device const fp64_scale_t* a [[buffer(0)]],
@@ -216,6 +220,7 @@ kernel void find_inner_shifts(device const fp64_scale_t* a [[buffer(0)]],
     int shift = 0;
     if (a[index].lowest_exponent != 2147483647 && b[index].lowest_exponent != 2147483647) {
         int difference = b[index].exponent - a[index].exponent;
+        // 負の整数に対する / 2 は0方向へ丸められるため、負の奇数のときだけ1を引いて floor((b - a) / 2) に揃える。
         shift = difference / 2 - int(difference < 0 && difference % 2 != 0);
     }
     inner_shifts[index] = shift;
@@ -223,19 +228,20 @@ kernel void find_inner_shifts(device const fp64_scale_t* a [[buffer(0)]],
 
 /**
  * @~japanese
- * @brief 入力を損失なく保持できる整数幅を行列全体について求める。
- * @param[in] a Aの行ごとの解析結果。
- * @param[in] b Bの列ごとの解析結果。
- * @param[out] analysis 必要な整数幅と非有限値の有無。
+ * @brief 行ごとおよび列ごとの解析結果を集計し、行列全体を切り捨てずに整数化できる整数幅と非有限値の有無を求める。
+ * @param[in] a 行列Aの行ごとの解析結果。
+ * @param[in] b 行列Bの列ごとの解析結果。
+ * @param[out] analysis 行列全体の整数幅p_A, p_Bと非有限値の有無の出力先。
  * @param[in] parameters 行列全体の寸法。
- * @param[in] lane SIMDグループ内の位置。
+ * @param[in] lane SIMDグループ内のスレッド番号（0～31）。
  * @~english
- * @brief Determine the integer widths needed to retain the entire input without loss.
- * @param[in] a Analysis of each row of A.
- * @param[in] b Analysis of each column of B.
- * @param[out] analysis Required integer widths and presence of nonfinite values.
- * @param[in] parameters Dimensions of the entire matrix.
- * @param[in] lane Position within the SIMD group.
+ * @brief Aggregate the per-row and per-column analyses to determine the integer widths p_A and p_B needed for
+ * lossless integer conversion of the full matrices and whether any nonfinite value is present.
+ * @param[in] a Per-row analysis of matrix A.
+ * @param[in] b Per-column analysis of matrix B.
+ * @param[out] analysis Output structure receiving the required integer widths and nonfinite flag.
+ * @param[in] parameters Dimensions of the full matrices.
+ * @param[in] lane Thread index within the SIMD group (0 to 31).
  * @~
  */
 kernel void analyse_inputs(device const fp64_scale_t* a [[buffer(0)]],
@@ -260,15 +266,16 @@ kernel void analyse_inputs(device const fp64_scale_t* a [[buffer(0)]],
 
 /**
  * @~japanese
- * @brief 整数化した値に共通する下位ゼロビット数の下限を求める。
+ * @brief 整数化した1つの行または列のすべての要素に共通する、下位に続くゼロのビット数の下限（最大8）を求める。
  * @param[in] scale 行または列の解析結果。
- * @param[in] precision 整数化に使う幅。
- * @return 8を上限とする下限。全要素がゼロの場合は8。
+ * @param[in] precision 整数化に使用する整数幅。
+ * @return 下位に続くゼロのビット数の下限（0～8）。行または列の全要素がゼロの場合は8。
  * @~english
- * @brief Compute a lower bound on the number of trailing zero bits shared by the integer-converted values.
- * @param[in] scale Analysis of a row or column.
- * @param[in] precision Width used for integer conversion.
- * @return Lower bound capped at 8. Eight if all elements are zero.
+ * @brief Compute a lower bound (capped at 8) on the number of trailing zero bits shared by all
+ * integer-converted elements in a row or column.
+ * @param[in] scale Analysis result for the row or column.
+ * @param[in] precision Integer width used for conversion.
+ * @return Lower bound on trailing zero bits (0 to 8), or 8 if all elements in the row or column are zero.
  * @~
  */
 static inline uint fp64_trailing_bits(fp64_scale_t scale, uint precision) {
@@ -278,49 +285,50 @@ static inline uint fp64_trailing_bits(fp64_scale_t scale, uint precision) {
 
 /**
  * @~japanese
- * @brief 整数化で桁を揃えた仮数と、剰余の係数を参照する指数。
+ * @brief 整数化のために桁位置を揃えた仮数と、2のべき乗の余りの表を参照するシフト量。
  * @~english
- * @brief Significand aligned for integer conversion and exponent indexing the residue coefficients.
+ * @brief Significand aligned for integer conversion paired with the shift amount indexing the power-of-two
+ * residue table.
  * @~
  */
 struct fp64_quantized_input_s {
-    fp64_bits_t mantissa; /**< @~japanese 整数化に使う仮数の絶対値。
-                           * @~english Significand magnitude used for integer conversion.
+    fp64_bits_t mantissa; /**< @~japanese 整数化で残る仮数の絶対値（最大53ビット）。
+                           * @~english Magnitude of the significand retained after alignment (at most 53 bits).
                            * @~
                            */
-    uint shift; /**< @~japanese 仮数に掛ける2のべき乗の指数。
-                 * @~english Exponent of the power of two multiplying the significand.
+    uint shift; /**< @~japanese 仮数に掛ける2のべき乗の指数（powers配列の添字）。
+                 * @~english Power-of-two exponent multiplying the significand (index into the powers table).
                  * @~
                  */
-    bool negative; /**< @~japanese 入力の符号。
-                    * @~english Input sign.
+    bool negative; /**< @~japanese 元の要素が負である場合はtrue。
+                    * @~english true if the original element is negative.
                     * @~
                     */
 };
 
 /**
  * @~japanese
- * @brief FP64の入力を、損失のない整数化に使う仮数と指数へ分解する。
- * @tparam shifted 内積方向の指数を調整する場合はtrue。
- * @param[in] bits 入力のビット列。
- * @param[in] precision 整数幅。
- * @param[in] scale 行または列の最大値の指数から、入力へ加える調整量を差し引いた値。
- * @return 法に依存しない整数化済みの仮数と指数。
- * @pre 入力が有限で、precisionが行または列の全非ゼロビットを保持できること。
+ * @brief 有限のFP64値を、法に依存しない整数化済みの仮数と2のべき乗のシフト量へ分解する。
+ * @tparam shifted 内積方向の指数の調整量を適用する場合はtrue。
+ * @param[in] bits 入力要素のFP64ビット列。
+ * @param[in] precision 行または列に適用する整数幅。
+ * @param[in] scale 行または列の最大値を囲む指数から、この要素に対する内積方向の調整量を引いた基準指数。
+ * @return 法に依存しない整数化済みの仮数、シフト量、および符号。
+ * @pre bitsは有限値であり、precisionはその行または列のすべての非ゼロビットを保持できる幅であること。
  * @~english
- * @brief Unpack an FP64 input into a significand and exponent for lossless integer conversion.
- * @tparam shifted true when adjusting exponents along the inner dimension.
- * @param[in] bits Input bit pattern.
- * @param[in] precision Integer width.
- * @param[in] scale Row or column maximum exponent minus the adjustment added to the input.
- * @return Integer-converted significand and exponent independent of the modulus.
- * @pre The input must be finite, and precision must retain all nonzero bits in the row or column.
+ * @brief Decompose a finite FP64 value into a modulus-independent aligned significand and power-of-two shift.
+ * @tparam shifted true when applying inner-dimension exponent adjustments.
+ * @param[in] bits FP64 bit pattern of the input element.
+ * @param[in] precision Integer width applied to the row or column.
+ * @param[in] scale Row or column bounding exponent minus the inner-dimension adjustment for this element.
+ * @return Modulus-independent aligned significand, shift amount, and sign.
+ * @pre bits must be finite, and precision must be wide enough to retain all nonzero bits in the row or column.
  * @~
  */
 template <bool shifted>
 static inline fp64_quantized_input_s fp64_quantize(fp64_bits_t bits, uint precision, int scale) {
     if constexpr (shifted) {
-        // ゼロには指数がない。他の要素から求めた調整量を使って、係数表の位置を作らない。
+        // 値がゼロの要素には有効な指数がないため、他の非ゼロ要素から決まった調整量によって範囲外のシフト量が作られないよう先に0を返す。
         if ((bits.low | (bits.high & 0x7fffffffu)) == 0) return {{0, 0}, 0, false};
     }
     uint raw_exponent = (bits.high >> 20) & 2047u;
@@ -337,27 +345,28 @@ static inline fp64_quantized_input_s fp64_quantize(fp64_bits_t bits, uint precis
 
 /**
  * @~japanese
- * @brief 入力の各要素からすべての法の余りを生成する。
- * @tparam shifted 内積方向の指数を調整する場合はtrue。
- * @param[in] input FP64のビット列。
- * @param[in] scales 行または列の指数。
- * @param[out] output 法ごとに連続したINT8の行列。
+ * @brief 入力行列の各要素を整数化し、使用するすべての法に対する符号付きINT8の余りを生成する。
+ * @tparam shifted 内積方向の指数の調整量を適用する場合はtrue。
+ * @param[in] input 入力行列のFP64ビット列。
+ * @param[in] scales 行または列ごとの解析結果。
+ * @param[out] output 法ごとに連続して並ぶ符号付きINT8の余り配列。
  * @param[in] parameters 行列の寸法と整数幅。
- * @param[in] plan 使用する法。
- * @param[in] column_mode Bを処理する場合は1、Aを処理する場合は0。
- * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
- * @param[in] position 対象要素の二次元の位置。
+ * @param[in] plan 使用する法と2のべき乗の余りの表。
+ * @param[in] column_mode 行列Bを処理する場合は1、行列Aを処理する場合は0。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ参照する。
+ * @param[in] position 処理する要素に対応する2次元グリッド上のスレッド位置。
  * @~english
- * @brief Generate residues for all moduli from each input element.
- * @tparam shifted true when adjusting exponents along the inner dimension.
- * @param[in] input FP64 bit patterns.
- * @param[in] scales Row or column exponents.
- * @param[out] output Contiguous INT8 matrix for each modulus.
+ * @brief Convert each element of an input matrix to integers and generate signed INT8 residues for all active
+ * moduli.
+ * @tparam shifted true when applying inner-dimension exponent adjustments.
+ * @param[in] input FP64 bit patterns of the input matrix.
+ * @param[in] scales Per-row or per-column analysis results.
+ * @param[out] output Output array of signed INT8 residues stored contiguously per modulus.
  * @param[in] parameters Matrix dimensions and integer widths.
- * @param[in] plan Moduli in use.
- * @param[in] column_mode One when processing B, zero when processing A.
- * @param[in] inner_shifts Exponent adjustments along the inner dimension. Used only when shifted is true.
- * @param[in] position Two-dimensional position of the element being processed.
+ * @param[in] plan Active moduli and power-of-two residue tables.
+ * @param[in] column_mode One when processing matrix B, zero when processing matrix A.
+ * @param[in] inner_shifts Inner-dimension exponent adjustments, read only when shifted is true.
+ * @param[in] position Two-dimensional thread position corresponding to the element being processed.
  * @~
  */
 template <bool shifted>
@@ -395,15 +404,15 @@ template [[host_name("make_shifted_residues")]] kernel void make_residues<true>(
 
 /**
  * @~japanese
- * @brief 対称な余り二つの和または差を、同じ範囲へ戻す。
- * @param[in] value 対称な余り二つの和または差。
+ * @brief 2つの対称な余りの和または差を、再び同じ対称な余りの範囲へ戻す。
+ * @param[in] value 2つの対称な余りの和または差。
  * @param[in] modulus 256以下の法。
- * @return INT8に収まる対称な余り。
+ * @return [-floor(m / 2), ceil(m / 2) - 1] の範囲にある符号付きINT8の余り。
  * @~english
- * @brief Reduce the sum or difference of two symmetric residues back to the same range.
+ * @brief Reduce the sum or difference of two symmetric residues back into the symmetric INT8 residue range.
  * @param[in] value Sum or difference of two symmetric residues.
  * @param[in] modulus Modulus at most 256.
- * @return Symmetric residue that fits in INT8.
+ * @return Signed INT8 symmetric residue in [-floor(m / 2), ceil(m / 2) - 1].
  * @~
  */
 static inline int8_t fp64_balance(int value, uint modulus) {
@@ -415,27 +424,28 @@ static inline int8_t fp64_balance(int value, uint modulus) {
 
 /**
  * @~japanese
- * @brief 四つの入力ブロックから、Strassen法の七つの演算の入力を生成する。
- * @tparam columns Bのブロックを処理する場合はtrue。
- * @tparam shifted 内積方向の指数を調整する場合はtrue。
- * @param[in] input FP64のビット列。
- * @param[in] scales 行または列の最大値の指数。
- * @param[out] output 法と演算ごとに並ぶ、ブロックの和と差。
- * @param[in] parameters 行列の寸法。
- * @param[in] plan 使用する法。
- * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ使用する。
- * @param[in] position ブロック内の二次元の位置。
+ * @brief 2x2に分割した4つの入力ブロックから、Strassen法の7つのブロック積に入力する和と差の余りを直接生成する。
+ * @tparam columns 行列Bのブロックを処理する場合はtrue、行列Aのブロックを処理する場合はfalse。
+ * @tparam shifted 内積方向の指数の調整量を適用する場合はtrue。
+ * @param[in] input 入力行列のFP64ビット列。
+ * @param[in] scales 行または列ごとの解析結果。
+ * @param[out] output 法および7つの演算ごとに連続して並ぶ符号付きINT8の余り配列。
+ * @param[in] parameters 行列の寸法と整数幅。
+ * @param[in] plan 使用する法と2のべき乗の余りの表。
+ * @param[in] inner_shifts 内積方向の指数の調整量。shiftedがtrueの場合だけ参照する。
+ * @param[in] position 分割後の1ブロック内の要素に対応する2次元グリッド上のスレッド位置。
  * @~english
- * @brief Generate inputs for the seven Strassen operations from four input blocks.
- * @tparam columns true when processing blocks of B.
- * @tparam shifted true when adjusting exponents along the inner dimension.
- * @param[in] input FP64 bit patterns.
- * @param[in] scales Maximum value exponents for each row or column.
- * @param[out] output Block sums and differences arranged by modulus and operation.
- * @param[in] parameters Matrix dimensions.
- * @param[in] plan Moduli in use.
- * @param[in] inner_shifts Exponent adjustments along the inner dimension. Used only when shifted is true.
- * @param[in] position Two-dimensional position within the block.
+ * @brief Directly generate the signed INT8 residue sums and differences for the seven Strassen block products
+ * from four 2x2 input blocks.
+ * @tparam columns true when processing blocks of matrix B, false when processing blocks of matrix A.
+ * @tparam shifted true when applying inner-dimension exponent adjustments.
+ * @param[in] input FP64 bit patterns of the input matrix.
+ * @param[in] scales Per-row or per-column analysis results.
+ * @param[out] output Output array of signed INT8 block sums and differences arranged by modulus and operation.
+ * @param[in] parameters Matrix dimensions and integer widths.
+ * @param[in] plan Active moduli and power-of-two residue tables.
+ * @param[in] inner_shifts Inner-dimension exponent adjustments, read only when shifted is true.
+ * @param[in] position Two-dimensional thread position corresponding to an element within one quarter-block.
  * @~
  */
 template <bool columns, bool shifted>
@@ -508,34 +518,32 @@ template [[host_name("strassen_shifted_operands_b")]] kernel void strassen_opera
 
 /**
  * @~japanese
- * @brief INT8の行列積を計算し、法ごとの余りだけを保存する。
- * @tparam single_chunk 内積全体の整数精度を一回の行列積で保てる場合はtrue。
- * @param[in] a 法ごとに並ぶAの余り。
- * @param[in] b 法ごとに並ぶBの余り。
- * @param[out] output 法ごとに並ぶ、0以上の出力の余り。
- * @param[in] parameters 行列の寸法。
- * @param[in] plan 使用する法。
- * @param[in] scales_a Aの行の指数と、整数化した値の下位ゼロビット数の下限。
- * @param[in] scales_b Bの列の指数と、整数化した値の下位ゼロビット数の下限。
- * @param[in] group 列、行、法の順で表す担当タイル。
- * @param[in] lane SIMDグループ内のスレッド位置。
- * @param[in] thread_index スレッドグループ内の位置。
+ * @brief INT8の余りの行列積をタイルごとに計算し、法で割った非負の余り（0以上m未満）を保存する。
+ * @tparam single_chunk 内積の項数がFP64_K_CHUNK（1024）以下であり、1回の行列積で厳密な内積が求まる場合はtrue。
+ * @param[in] a 法（Strassen法では法と演算）ごとに並ぶ行列Aの余り。
+ * @param[in] b 法（Strassen法では法と演算）ごとに並ぶ行列Bの余り。
+ * @param[out] output 法（Strassen法では法と演算）ごとに並ぶ、0以上m未満の出力の余り。
+ * @param[in] parameters 行列の寸法と整数幅。
+ * @param[in] plan 使用する法と剰余計算用の定数。
+ * @param[in] scales_a 行列Aの行ごとの解析結果（法256での下位ゼロビット数の判定に使用する）。
+ * @param[in] scales_b 行列Bの列ごとの解析結果（法256での下位ゼロビット数の判定に使用する）。
+ * @param[in] group 担当する出力タイル（列タイル、行タイル、法または演算の番号）。
+ * @param[in] lane SIMDグループ内のスレッド番号（0～31）。
+ * @param[in] thread_index スレッドグループ内の通し番号。
  * @~english
- * @brief Compute an INT8 matrix product and store only the residues for each modulus.
- * @tparam single_chunk true when a single matrix multiplication preserves integer precision for the entire
- * dot product.
- * @param[in] a Residues of A arranged by modulus.
- * @param[in] b Residues of B arranged by modulus.
- * @param[out] output Nonnegative output residues arranged by modulus.
- * @param[in] parameters Matrix dimensions.
- * @param[in] plan Moduli in use.
- * @param[in] scales_a Row exponents of A and a lower bound on trailing zero bits in the integer-converted
- * values.
- * @param[in] scales_b Column exponents of B and a lower bound on trailing zero bits in the integer-converted
- * values.
- * @param[in] group Assigned tile specified in column, row, modulus order.
- * @param[in] lane Thread position within the SIMD group.
- * @param[in] thread_index Position within the threadgroup.
+ * @brief Compute a tile of an INT8 modular matrix product and store nonnegative residues in [0, m).
+ * @tparam single_chunk true when the dot-product length is at most FP64_K_CHUNK (1024) so that a single matrix
+ * multiplication preserves exact integer sums.
+ * @param[in] a INT8 residues of A arranged by modulus (and by Strassen operation when active).
+ * @param[in] b INT8 residues of B arranged by modulus (and by Strassen operation when active).
+ * @param[out] output Nonnegative output residues in [0, m) arranged by modulus (and Strassen operation).
+ * @param[in] parameters Matrix dimensions and integer widths.
+ * @param[in] plan Active moduli and reduction constants.
+ * @param[in] scales_a Per-row analysis of A, used to check trailing zero bits for modulus 256.
+ * @param[in] scales_b Per-column analysis of B, used to check trailing zero bits for modulus 256.
+ * @param[in] group Assigned output tile (column tile, row tile, modulus or operation index).
+ * @param[in] lane Thread index within the SIMD group (0 to 31).
+ * @param[in] thread_index Linear thread index within the threadgroup.
  * @~
  */
 template <bool single_chunk>
@@ -552,6 +560,8 @@ kernel void residue_matmul(device int8_t* a [[buffer(0)]],
     uint row = group.y * FP64_TILE_ROWS, column = group.x * FP64_TILE_COLUMNS;
     fp64_modulus_t modulus = plan.moduli[parameters.strassen ? group.z / 7 : group.z];
     if (modulus.value == 256) {
+        // 法256では、タイル内のAの行とBの列における下位ゼロビット数の下限の和が8以上であれば、
+        // 内積のすべての項が 2^8 = 256 の倍数となるため、行列積の実行を省いて0を書き込む。
         uint trailing_a = 8, trailing_b = 8;
         for (uint index = lane; index < FP64_TILE_ROWS; index += 32) {
             uint input_row = row + index;
@@ -623,6 +633,7 @@ kernel void residue_matmul(device int8_t* a [[buffer(0)]],
                     accumulated[i] += partial[i];
                 }
             }
+            // 符号付き32ビット整数のオーバーフローを防ぐため、65536項ごとに法で割った余りへ戻す。
             if ((begin + length) % FP64_K_ACCUMULATE == 0 && begin + length < parameters.inner) {
                 #pragma unroll
                 for (uint i = 0; i < accumulated.get_capacity(); ++i) {
@@ -655,19 +666,21 @@ template [[host_name("residue_matmul_accumulate")]] kernel void residue_matmul<f
 
 /**
  * @~japanese
- * @brief 七つのブロック積から、四つの出力ブロックの余りを組み立てる。
- * @param[in] residues 法と演算ごとに並ぶ七つの積の余り。
- * @param[out] output 法ごとに並ぶ出力の余り。
+ * @brief Strassen法の7つのブロック積の余りを加減算し、2x2の4つの出力ブロックの余りを組み立てる。
+ * @param[in] residues 法および7つの演算ごとに並ぶブロック積の余り。
+ * @param[out] output 法ごとに並ぶ出力行列の余り。
  * @param[in] parameters 行列の寸法。
- * @param[in] plan 使用する法。
- * @param[in] position ブロックの中の二次元の位置と、出力ブロックの番号。
+ * @param[in] plan 使用する法と剰余計算用の定数。
+ * @param[in] position 出力ブロック内の要素の2次元位置（x, y）と、4つの出力ブロックの番号（z = 0..3）。
  * @~english
- * @brief Assemble residues for four output blocks from seven block products.
- * @param[in] residues Residues of the seven products arranged by modulus and operation.
- * @param[out] output Output residues arranged by modulus.
+ * @brief Combine the residues of the seven Strassen block products into the residues of the four 2x2 output
+ * blocks.
+ * @param[in] residues Residues of the seven block products arranged by modulus and operation.
+ * @param[out] output Output matrix residues arranged by modulus.
  * @param[in] parameters Matrix dimensions.
- * @param[in] plan Moduli in use.
- * @param[in] position Two-dimensional position within the block and the output block number.
+ * @param[in] plan Active moduli and reduction constants.
+ * @param[in] position Two-dimensional element position within an output block (x, y) and output block index
+ * (z = 0..3).
  * @~
  */
 kernel void strassen_combine(device const uchar* residues [[buffer(0)]],
@@ -694,31 +707,33 @@ kernel void strassen_combine(device const uchar* residues [[buffer(0)]],
                                 + blocks[2 * block_count] + blocks[5 * block_count]; break;
         }
         fp64_modulus_t modulus = plan.moduli[t];
+        // combined には最大1個のブロック積が減算されるため、2 * m を足して非負にしてから余りを求める。
         output[ulong(t) * count + output_index] = uchar(fp64_word_mod(uint(combined + int(2 * modulus.value)), modulus));
     }
 }
 
 /**
  * @~japanese
- * @brief 出力要素ごとにCRTを復元し、FP64のビット列を保存する。
- * @tparam limb_count スレッドが保持する整数の桁数。
+ * @brief 各出力要素について法ごとの余りからCRTで厳密な内積を復元し、FP64へ丸めたビット列を書き出す。
+ * @tparam limb_count 各スレッドが保持する多倍長整数の桁数。
  * @param[in] residues 法ごとに並ぶ出力の余り。
- * @param[in] scales_a Aの行の指数。
- * @param[in] scales_b Bの列の指数。
- * @param[out] output FP64のビット列。
+ * @param[in] scales_a 行列Aの行ごとの解析結果。
+ * @param[in] scales_b 行列Bの列ごとの解析結果。
+ * @param[out] output 出力行列のFP64ビット列。
  * @param[in] parameters 行列の寸法と整数幅。
- * @param[in] plan CRTの係数。
- * @param[in] position 行のまとまりの中の二次元の出力位置。
+ * @param[in] plan CRTの復元係数と法の積。
+ * @param[in] position 行のまとまり内の出力要素に対応する2次元グリッド上のスレッド位置。
  * @~english
- * @brief Reconstruct each output element using CRT and store its FP64 bit pattern.
- * @tparam limb_count Number of integer digits held by each thread.
+ * @brief Reconstruct the exact dot product for each output element from its modular residues using CRT and
+ * write the rounded FP64 bit pattern.
+ * @tparam limb_count Number of multi-precision integer digits held by each thread.
  * @param[in] residues Output residues arranged by modulus.
- * @param[in] scales_a Row exponents of A.
- * @param[in] scales_b Column exponents of B.
- * @param[out] output FP64 bit patterns.
+ * @param[in] scales_a Per-row analysis of matrix A.
+ * @param[in] scales_b Per-column analysis of matrix B.
+ * @param[out] output Output FP64 bit patterns.
  * @param[in] parameters Matrix dimensions and integer widths.
- * @param[in] plan CRT coefficients.
- * @param[in] position Two-dimensional output position within the row batch.
+ * @param[in] plan CRT reconstruction coefficients and modulus product.
+ * @param[in] position Two-dimensional thread position corresponding to an output element within the row batch.
  * @~
  */
 template <uint limb_count>
@@ -753,6 +768,8 @@ kernel void reconstruct(device const uchar* residues [[buffer(0)]],
         product.digits[digit] = plan.product.digits[digit];
         half_product.digits[digit] = plan.half_product.digits[digit];
     }
+    // FP32の比から求めた近似商 multiplier の誤差は 0.1 未満であるため、差 |value - multiple| は必ず P 未満になる。
+    // その差が P / 2 を超える場合は P を1回引いて対称な範囲 [-P / 2, P / 2) の絶対値と符号を確定する。
     bool negative = fp64_big_compare(value, multiple, limb_count) < 0;
     value = negative ? fp64_big_subtract(multiple, value, limb_count)
                      : fp64_big_subtract(value, multiple, limb_count);
@@ -769,13 +786,13 @@ kernel void reconstruct(device const uchar* residues [[buffer(0)]],
 
 /**
  * @~japanese
- * @brief 整数配列の容量を指定して、Metalの復元カーネルを宣言する。
- * @param[in] name Metalで使用する名前の接尾辞。
- * @param[in] size スレッドが保持する整数の桁数。
+ * @brief 指定した多倍長整数の桁数でCRT復元用カーネルのテンプレートを実体化する補助マクロ。
+ * @param[in] name Metalライブラリー内のカーネル名の接尾辞。
+ * @param[in] size 各スレッドが保持する多倍長整数の桁数。
  * @~english
- * @brief Declare a Metal reconstruction kernel with a specified integer array capacity.
- * @param[in] name Name suffix used by Metal.
- * @param[in] size Number of integer digits held by each thread.
+ * @brief Helper macro instantiating the CRT reconstruction kernel template for a specified digit capacity.
+ * @param[in] name Kernel name suffix in the Metal library.
+ * @param[in] size Number of multi-precision integer digits held by each thread.
  * @~
  */
 #define FP64_RECONSTRUCTION_KERNEL(name, size) \
@@ -785,23 +802,24 @@ FP64_RECONSTRUCTION_KERNELS(FP64_RECONSTRUCTION_KERNEL)
 
 /**
  * @~japanese
- * @brief タイルを共有し、FP64の積和で行列積を求める。
- * @tparam finite_inputs 両入力が有限であることが確定している場合はtrue。
- * @param[in] a Aのビット列。
- * @param[in] b Bのビット列。
- * @param[out] output FP64のビット列。
+ * @brief スレッドグループの共有メモリーに分解済みのタイルを読み込み、GPUの整数演算によるFP64の積和演算で行列積を求める。
+ * @tparam finite_inputs 行列AとBの両方が有限値だけを含むと分かっている場合はtrue。
+ * @param[in] a 行列AのFP64ビット列。
+ * @param[in] b 行列BのFP64ビット列。
+ * @param[out] output 出力行列のFP64ビット列。
  * @param[in] parameters 行列全体の寸法。
- * @param[in] group 担当する列と行のタイル。
- * @param[in] local タイル内の列と行。
+ * @param[in] group 担当する16x16の出力タイル（列タイル、行タイル）。
+ * @param[in] local 16x16タイル内のスレッド位置（列オフセット、行オフセット）。
  * @~english
- * @brief Compute a matrix product with FP64 fused multiply-add using shared tiles.
- * @tparam finite_inputs true when both inputs are known to be finite.
- * @param[in] a Bit patterns of A.
- * @param[in] b Bit patterns of B.
- * @param[out] output FP64 bit patterns.
- * @param[in] parameters Dimensions of the entire matrix.
- * @param[in] group Assigned column and row tiles.
- * @param[in] local Column and row within the tile.
+ * @brief Load unpacked input tiles into threadgroup shared memory and compute the matrix product using
+ * integer-based FP64 fused multiply-add on the GPU.
+ * @tparam finite_inputs true when both input matrices A and B are known to contain only finite values.
+ * @param[in] a FP64 bit patterns of matrix A.
+ * @param[in] b FP64 bit patterns of matrix B.
+ * @param[out] output Output FP64 bit patterns.
+ * @param[in] parameters Dimensions of the full matrices.
+ * @param[in] group Assigned 16x16 output tile (column tile, row tile).
+ * @param[in] local Thread coordinates within the 16x16 tile (column offset, row offset).
  * @~
  */
 template <bool finite_inputs>

@@ -2,136 +2,200 @@
 
 [日本語](README.md) | English
 
-AppleSilicon-FP64 is a library and an experimental command-line tool for computing dense real matrix products in FP64 format using Metal on Apple Silicon. The public API and command-line tool are implemented in C. Metal resource management and dispatch are implemented in Objective-C. C++ callers can use the same C header and functions. Depending on the input values, the library selects either matrix multiplication using integer residues or FP64 fused multiply-add using integer arithmetic. All numerical operations that depend on the input values run on the GPU.
+AppleSilicon-FP64 is a library and experimental command-line tool that computes dense real matrix products $C = AB$ in FP64 (double-precision floating-point) format on Apple Silicon GPUs using Metal.
 
-## Glossary
+All numerical operations that depend on the input values run on the GPU. The library first analyzes the exponent ranges of the input matrices on the GPU. When the inputs can be converted to integers without losing any bits, it computes the product using INT8 modular matrix multiplication followed by reconstruction via the Chinese remainder theorem (CRT). CRT uniquely recovers an integer within a known range from its remainders modulo several pairwise coprime divisors, which are referred to as "moduli." Conversely, when the input exponent range is too wide to fit within the CRT range, or when the inputs contain NaNs or infinities, the library computes each dot product on the GPU using FP64 fused multiply-add (FMA) implemented with 128-bit integer arithmetic.
 
-| Term | Meaning in this document |
-|---|---|
-| Modulus | The divisor used to compute an integer remainder. |
-| CRT | Reconstruction using the Chinese remainder theorem. Remainders modulo several moduli uniquely determine an integer within a given range. |
-| Integer width | The number of binary digits required to represent the inputs as integers without loss, using the maximum value in each row or column as the reference. This is different from the number of significand bits in FP64. |
+The public API and command-line tool are written in C (C11), while Metal resource management and GPU command dispatch are written in Objective-C. C++ programs can include the same C header and call the functions directly without a wrapper.
 
 ## Numerical semantics
 
-The inputs are contiguous, row-major matrices $`A`$ and $`B`$ containing FP64 values. All finite values, subnormal numbers, signed zeros, NaNs, and infinities are supported. Empty matrices and $`K=0`$ are allowed. BLAS-compatible operations with scaling coefficients or transposition are outside the scope of the library.
+The inputs are contiguous, row-major matrices $A$ ($M \times K$) and $B$ ($K \times N$) containing FP64 values. In addition to ordinary finite values, the library supports subnormal numbers, signed zeros, NaNs, and infinities. Empty matrices ($M = 0$ or $N = 0$) and zero-length dot products ($K = 0$) are also accepted. BLAS-style operations involving scaling coefficients or matrix transposition are outside the scope of this library.
 
-For each row of matrix $`A`$, the library determines $`h_i=1+\lfloor\log_2\max_k|A_{ik}|\rfloor`$. For each column of matrix $`B`$, it determines $`g_j`$ using the same definition. The exponent is 0 when all elements are zero. Exponents are obtained from the FP64 bit patterns. NaNs and infinities are excluded from this analysis.
+The following diagram shows how the library analyzes the input matrices, selects a computation method, and produces the output matrix $\widehat{C}$.
 
-For finite nonzero values, let $`\ell_i`$ and $`t_j`$ be the smallest exponents of the least significant nonzero bits in each row and column, respectively. The required width is 1 when all elements are zero. The integer widths needed to preserve the inputs without loss are determined as follows:
+```mermaid
+flowchart TD
+    start["Analyze input matrices A and B on the GPU"] --> check_finite{"Are all elements finite?"}
+    check_finite -- "Contains NaN or infinity" --> fma["Run sequential FP64 fused multiply-add on the original inputs using GPU integer arithmetic"]
+    check_finite -- "All elements are finite" --> calc_width["Determine the binary digit widths p_A and p_B needed for lossless integer conversion"]
+    calc_width --> check_crt1{"Can the product of available moduli cover the dot-product range?"}
+    check_crt1 -- "Yes" --> crt["Convert original inputs to INT8 residues, run matrix multiplication, and reconstruct via CRT"]
+    check_crt1 -- "No" --> adjust["Adjust exponents along the inner dimension and recompute p_A and p_B"]
+    adjust --> check_crt2{"Can the product of available moduli cover the adjusted range?"}
+    check_crt2 -- "Yes" --> crt_shifted["Convert adjusted inputs to INT8 residues, run matrix multiplication, and reconstruct via CRT"]
+    check_crt2 -- "No" --> fma
+```
 
-$$
-p_A=\max_i\max(1,h_i-\ell_i),\qquad
-p_B=\max_j\max(1,g_j-t_j)
-$$
+### Determining the required integer widths
 
-If all inputs are finite, the library checks whether the product of the available moduli can cover the original integer widths and the dot-product length. If it cannot, the library adjusts exponents along the inner dimension and recomputes the integer widths.
-
-The adjustment is determined from the maximum absolute values in column $`k`$ of A and row $`k`$ of B. If either consists entirely of zeros, $`d_k=0`$. Otherwise, the library uses the following exponents and adjustment:
-
-$$
-\alpha_k=1+\left\lfloor\log_2\max_i|A_{ik}|\right\rfloor,\qquad
-\beta_k=1+\left\lfloor\log_2\max_j|B_{kj}|\right\rfloor
-$$
-
-$$
-d_k=\left\lfloor\frac{\beta_k-\alpha_k}{2}\right\rfloor,\qquad
-\widetilde A_{ik}=A_{ik}2^{d_k},\qquad
-\widetilde B_{kj}=B_{kj}2^{-d_k}
-$$
-
-Each product satisfies $`\widetilde A_{ik}\widetilde B_{kj}=A_{ik}B_{kj}`$. The same procedure is applied to the adjusted values to determine the row and column exponents and integer widths. The adjusted values are not rounded to FP64.
-
-If the required range can be covered for either the original inputs or the inputs with adjusted exponents, the library uses INT8 matrix multiplication and CRT. Conversion to integers does not truncate any information. Each output is the exact dot product rounded to FP64 using round-to-nearest, ties-to-even. An output whose exact value is zero is positive zero.
+Excluding NaNs and infinities, the library inspects the FP64 bit patterns of finite elements to extract their power-of-two exponents. For each row $i$ of $A$ and each column $j$ of $B$, it determines the exponents $h_i$ and $g_j$ that bound the maximum absolute values according to the following formulas. When all elements in a row or column are zero, the exponent for that row or column is set to $0$.
 
 $$
-\widehat C_{ij}=\mathrm{RN}_{64}\left(\sum_{k=0}^{K-1} A_{ik}B_{kj}\right)
+h_i = 1 + \left\lfloor \log_2 \max_k |A_{ik}| \right\rfloor, \qquad
+g_j = 1 + \left\lfloor \log_2 \max_k |B_{kj}| \right\rfloor
 $$
 
-If the product of the moduli cannot cover the required integer range even after exponent adjustment, or if the inputs contain NaNs or infinities, the library uses the original inputs and performs FP64 fused multiply-add using integer arithmetic on the GPU. Each dot product starts from $`s_0=+0`$ and proceeds in input order along the inner dimension. Each fused multiply-add rounds the product and addition together once, using round-to-nearest, ties-to-even.
+Next, for finite nonzero elements, let $\ell_i$ be the minimum exponent of the least significant nonzero bit across row $i$ of $A$, and let $t_j$ be the corresponding minimum exponent across column $j$ of $B$. Using the maximum value in each row or column as the reference, the number of binary digits required to represent all elements as integers without truncation is called the "integer width" and is defined as $p_A$ and $p_B$ below. When all elements in a row or column are zero, its required width is $1$. Note that the integer width reflects the spread of exponents across a row or column and differs from the 53-bit significand width of a single FP64 number.
 
 $$
-s_{k+1}=\mathrm{RN}_{64}(A_{ik}B_{kj}+s_k),\qquad
-\widehat C_{ij}=s_K
+p_A = \max_i \max(1, h_i - \ell_i), \qquad
+p_B = \max_j \max(1, g_j - t_j)
 $$
 
-Both methods round subnormal results directly to the FP64 subnormal spacing. Overflow produces a signed infinity. A negative nonzero value that rounds to zero produces negative zero. A fused multiply-add involving a NaN, multiplication of zero by infinity, or addition of infinities with opposite signs returns a quiet NaN with the bit pattern `0x7ff8000000000000`. NaN payloads and CPU floating-point exception flags are not propagated.
+### Adjusting exponents along the inner dimension
 
-The number and order of rounding operations differ between the two methods. The library does not guarantee bitwise agreement with `cblas_dgemm`, or rounding of the exact dot product only once for every possible input. Inputs are not truncated in advance, even when their exponents span a wide range.
+Even when all elements are finite, the original integer widths $p_A$ and $p_B$ may be too large for the product of the available moduli to cover the dot-product range. However, in each term $A_{ik} B_{kj}$ of the dot product, scaling column $k$ of $A$ and row $k$ of $B$ by opposite powers of two leaves their product unchanged. Therefore, when the original integer widths exceed the capacity of the available moduli, the library adjusts exponents along the inner dimension $k$ and recomputes the integer widths.
+
+Each adjustment $d_k$ is derived from the maximum absolute values in column $k$ of $A$ and row $k$ of $B$. If either column $k$ of $A$ or row $k$ of $B$ consists entirely of zeros, $d_k = 0$. Otherwise, the library computes the exponents $\alpha_k$ and $\beta_k$ and the shift $d_k$ as follows:
+
+$$
+\alpha_k = 1 + \left\lfloor \log_2 \max_i |A_{ik}| \right\rfloor, \qquad
+\beta_k = 1 + \left\lfloor \log_2 \max_j |B_{kj}| \right\rfloor
+$$
+
+$$
+d_k = \left\lfloor \frac{\beta_k - \alpha_k}{2} \right\rfloor, \qquad
+\widetilde{A}_{ik} = A_{ik} 2^{d_k}, \qquad
+\widetilde{B}_{kj} = B_{kj} 2^{-d_k}
+$$
+
+Each scaled pair satisfies $\widetilde{A}_{ik} \widetilde{B}_{kj} = A_{ik} B_{kj}$. Rather than rounding $\widetilde{A}_{ik}$ and $\widetilde{B}_{kj}$ back to FP64, the library adds or subtracts $d_k$ directly on the integer exponents and applies the same procedure to recompute the row and column exponents and the integer widths $p_A$ and $p_B$.
+
+### Method selection and rounding rules
+
+If the product of the available moduli can cover the required dot-product range, either for the original inputs or after inner-dimension exponent adjustment, the library uses INT8 matrix multiplication and CRT reconstruction. Converting the inputs to integers does not discard any nonzero bits. Each output element $\widehat{C}_{ij}$ is the exact dot product rounded once to FP64 using round-to-nearest, ties-to-even ($\mathrm{RN}_{64}$). When the exact dot product is zero, the output is positive zero ($+0.0$).
+
+$$
+\widehat{C}_{ij} = \mathrm{RN}_{64}\left(\sum_{k=0}^{K-1} A_{ik} B_{kj}\right)
+$$
+
+Conversely, if the required integer width still exceeds the product of the moduli after exponent adjustment, or if the inputs contain any NaN or infinity, the library uses the unadjusted inputs and executes FP64 fused multiply-add on the GPU using integer arithmetic. Each dot product starts from $s_0 = +0.0$ and accumulates terms in ascending order of $k = 0, 1, \dots, K-1$. Each step rounds the exact sum of the product and accumulator once to FP64 using round-to-nearest, ties-to-even:
+
+$$
+s_{k+1} = \mathrm{RN}_{64}(A_{ik} B_{kj} + s_k), \qquad
+\widehat{C}_{ij} = s_K
+$$
+
+Both computation methods follow the same rules for subnormal values, overflow, signed zero, and nonfinite results:
+
+- Results in the subnormal range are rounded directly to the FP64 subnormal spacing without intermediate normal rounding.
+- Magnitudes that exceed the maximum finite FP64 value overflow to signed infinity.
+- A negative nonzero value that underflows to zero produces negative zero ($-0.0$).
+- Any fused multiply-add involving a NaN, multiplication of zero by infinity, or addition of infinities with opposite signs returns a quiet NaN with the canonical bit pattern `0x7ff8000000000000`. Input NaN payloads are not preserved, and CPU floating-point exception flags are not modified.
+
+Because the number and order of rounding operations depend on the selected method and differ from CPU BLAS implementations, the library does not guarantee bitwise agreement with `cblas_dgemm`. Likewise, when the sequential FMA path is selected, rounding occurs at every accumulation step rather than once on the exact dot product.
 
 ## GPU computation
 
-The following table describes the operations performed on the GPU.
+The table below summarizes the main operations executed on the GPU and how each stage is implemented.
 
-| Operation | Implementation |
+| Operation | GPU implementation |
 |---|---|
-| Input analysis | Inspect the exponents and least significant bits of FP64 bit patterns to determine the required integer widths and whether nonfinite values are present. |
-| Conversion to INT8 residues | Compute the residues of the integer representations from the significands and exponents. |
-| Matrix multiplication with INT8 inputs and INT32 accumulation | Use Metal's `mpp::tensor_ops::matmul2d`. |
-| CRT and rounding to FP64 format | Construct the output bit patterns from integer arrays. |
-| FP64 fused multiply-add | Represent the significand product and addend as integers, add them, and round to an FP64 bit pattern. |
+| Input analysis | Inspect the exponents and least significant nonzero bits of the FP64 bit patterns to determine the required integer widths and whether nonfinite values are present. |
+| Conversion to INT8 residues | Construct integer representations from the significands and exponents, then compute their remainders modulo each modulus as signed INT8 values. |
+| INT8 matrix multiplication | Execute Metal 4's `mpp::tensor_ops::matmul2d` with INT8 inputs and INT32 accumulation. |
+| CRT reconstruction and FP64 rounding | Reconstruct the exact dot product in multi-precision integer arrays from the per-modulus remainders, then round to an FP64 bit pattern. |
+| FP64 fused multiply-add | Add or subtract the exact significand product and aligned addend in 128-bit integers, then round each step to an FP64 bit pattern. |
 
-Analysis of the rows of A and the columns of B is encoded in the same Metal compute command encoder and runs concurrently. After both analyses complete, synchronization makes their memory writes visible to subsequent operations. The integer widths and the presence of nonfinite values are then aggregated.
+### Input analysis and CPU dispatch
 
-When exponent adjustment is needed, analysis results for the columns of A and the rows of B are stored in the same analysis buffers, and the GPU computes the adjustments. Once the adjustments have been computed, the row and column analysis results are updated using the adjusted exponents. Computing the adjustments and repeating the analysis are combined into one additional Metal submission. The input bit patterns are preserved; integer exponents are added or subtracted during analysis and residue conversion. Strassen's algorithm also uses the adjustments along the inner dimension that correspond to each block.
+GPU kernels read each 64-bit FP64 input element as two 32-bit unsigned integers. First, the CPU encodes the row analysis of $A$ and the column analysis of $B$ into a single concurrent Metal compute command encoder. During the column analysis of $B$, adjacent threads read adjacent columns to coalesce memory accesses, while multiple SIMD groups divide the work along the inner dimension. Once both analyses complete and a memory barrier makes their writes visible, an aggregation kernel writes the overall integer widths $p_A, p_B$ and a nonfinite flag into a 12-byte result buffer.
+
+If this initial analysis shows that all elements are finite but the integer widths exceed the CRT range, the CPU submits one additional command buffer to perform exponent adjustment. This submission reuses the scale buffers to analyze the columns of $A$ and the rows of $B$, computes the inner-dimension shifts $d_k$ on the GPU, and updates the row and column analysis results using the adjusted exponents. The original FP64 input buffers remain unmodified; the analysis and residue-conversion kernels add or subtract $d_k$ on the integer exponents directly.
+
+The CPU reads only the 12-byte analysis summary from the GPU to select the compute pipeline and allocate workspace buffers. When the CRT path is selected, the CPU prepares reconstruction coefficients and residue lookup tables that depend only on the dimensions and integer widths, never scanning matrix elements or computing dot products on the CPU. After encoding and submitting all GPU work, the CPU waits for GPU completion before returning the output.
 
 ### Matrix multiplication using integer residues
 
-The moduli are pairwise coprime integers no greater than 256, used in descending order. Composite moduli allow multiple prime factors to be handled by a single matrix multiplication. Moduli are selected until their product $`P`$ satisfies $`P>2K2^{p_A+p_B}`$. Method selection and rounding semantics are defined in “Numerical semantics.”
+#### Selecting moduli and reusing coefficients
 
-Residues are represented in signed INT8. Each dot product is split into segments for which the sum of the absolute values of all terms is at most $`2^{24}`$. Within this range, integers can be represented exactly even by an execution path that uses FP32 intermediate values. Partial dot products are added in INT32, and residues are computed at intervals that prevent overflow. The INT32 output type alone is not taken as evidence that an entire long dot product is computed with exact integer arithmetic. Splitting does not change the exponents used for conversion to integers.
+Moduli are chosen in descending order from 49 pairwise coprime integers at most 256 (`256, 255, 253, ..., 29`). Including composite moduli allows multiple prime factors to be handled within a single matrix multiplication. The library adds moduli in descending order until their product $P = \prod_t m_t$ satisfies:
 
-For CRT, the library constructs $`W_t=(P/m_t)((P/m_t)^{-1}\bmod m_t)`$ for each modulus. Let $`r_t`$ be the residue for each output. The library computes $`Y=\sum_t r_t W_t`$ using an integer array in radix $`2^{18}`$. The sum of digit products and the carry for each digit fit in a 32-bit unsigned integer. Each digit's sum is independent of the other digits.
+$$
+P > 2K 2^{p_A + p_B}
+$$
 
-The ratio $`Y/P`$ is approximated in FP32 from the coefficient ratios and residues, and a nearby integer $`q`$ is selected. There are at most 49 moduli, and each residue is at most 255. Within this range, the absolute error from rounding the ratios and adding them is less than 0.1. The exact integer difference $`Y-qP`$ therefore has an absolute value less than $`P`$. If its absolute value exceeds $`P/2`$, a single addition or subtraction of $`P`$ determines the signed result. FP32 is used to select the candidate; reconstruction of the output value and final rounding use integer arithmetic.
+The division coefficients for each modulus, the lookup tables of power-of-two residues, and the CRT reconstruction weights depend only on the inner dimension $K$ and the integer widths $p_A$ and $p_B$. Whenever $K$, $p_A$, and $p_B$ match those of the previous call, the multiplier reuses the existing coefficients and runs only the GPU input conversion for the new matrix values.
 
-Multiple SIMD groups share the matrix multiplication tiles. When the row, column, and inner-dimension ranges cover a complete tile, compile-time tensor dimensions are used. At matrix edges, the actual dimensions are used.
+#### Row batching and conversion to INT8 residues
 
-When an entire dot product fits within the range that preserves exact integer results in a single multiplication, the library uses a pipeline without an array of partial dot products or an accumulation step. For long dot products, the final residue calculation and output write occur in the same iteration.
+To bound intermediate memory usage, the residue matrix for $B$ is generated once and retained for the entire call, whereas $A$ and the output $C$ are processed in batches of rows (`batch_rows`).
 
-A lower bound on the number of trailing zero bits shared by all integer representations is derived from the input analysis and the selected integer widths. For a block product modulo 256, the minimum of these bounds is determined over the relevant rows of A and columns of B. If the two minima sum to at least 8, every term in the dot product is a multiple of 256, so the multiplication is skipped and zero is written. With Strassen's algorithm, the minimum includes both blocks used to form each sum or difference.
+In the residue-conversion kernel, each FP64 element is unpacked into its significand and exponent only once regardless of the number of moduli. When shifting a significand to the right to align it with the row or column reference exponent, the choice of $p_A$ and $p_B$ guarantees that all shifted-out bits are zero. The power-of-two residues multiplying the high and low words of the significand are fetched from a single table that packs both 8-bit residues into one 16-bit entry. For each modulus, the kernel computes the remainder from the upper 32 bits of a multiplication (`mulhi`) and at most one subtraction, then maps the result into a symmetric signed INT8 residue.
 
-For large matrix products using integer residues, the library applies one level of Strassen's algorithm. It partitions each matrix into four blocks and computes the result with seven block products instead of eight. Block sums and differences are also computed using integer arithmetic modulo each modulus, so the definitions of integer conversion and final rounding do not change. This method is used when M and N are at least 1024, M is even, N is a multiple of 128, K is a multiple of 2048, and each row batch contains at least 128 rows. Equal numbers of rows from the top and bottom halves are processed together, keeping the total number of retained rows within the configured limit. Dedicated kernels assemble the four output blocks before CRT reconstruction.
+#### INT8 matrix multiplication and dot-product splitting
 
-CRT pipelines are created for different integer-array capacities. The library selects a capacity that can hold the required digits, so GPU threads do not carry unnecessary high-order digits.
+In the matrix-multiplication kernel, four SIMD groups cooperate on each $64 \times 64$ output tile. When a tile lies entirely within the matrix boundaries and covers a full 1024-term inner chunk, the kernel uses compile-time tensor dimensions; at matrix edges, it uses dynamic runtime dimensions.
 
-Input conversion computes a division coefficient once for each modulus. Residues are obtained using the high 32 bits of a multiplication and one correction. Each input is decomposed into a significand and exponent only once, regardless of the number of moduli. When lower input bits are shifted to the right, all discarded bits are zero. The residues of powers of two used for the upper and lower parts of the significand are obtained from a single table. When obtaining exponents for B, adjacent threads read adjacent columns, and multiple SIMD groups share the inner dimension.
+Even though Metal's `matmul2d` accumulates into an INT32 output tensor, an execution path that uses FP32 intermediate values can represent integers exactly only up to $2^{24}$. Therefore, rather than assuming exact integer accumulation across arbitrarily long dot products from the INT32 output type alone, the library splits the inner dimension $K$ into chunks of at most 1024 terms so that the sum of absolute term products in each chunk never exceeds $1024 \times 128^2 = 2^{24}$. Splitting the dot product does not alter the exponents used for integer conversion.
 
-Reconstruction and input-conversion coefficients are reused when the dot-product length and the integer widths of both inputs remain the same. Input values are converted on the GPU on every call.
+- When $K \le 1024$, the library dispatches a single-chunk pipeline that omits partial-sum arrays and accumulation loops.
+- When $K > 1024$, the accumulating pipeline adds chunk products in INT32 and reduces the running sum modulo $m_t$ every 65,536 terms to prevent signed 32-bit overflow. In the final chunk iteration, modulo reduction and writing the output residue happen in a single step.
 
-The matrix-multiplication input for $`B`$ is generated once and retained. $`A`$ and the output are processed in row batches. For Strassen's algorithm, conversion from FP64 to integers and the block sums and differences are computed in the same kernel, without storing intermediate residue matrices.
+For modulus 256, the kernel uses the input analysis results and $p_A, p_B$ to derive a lower bound on the number of trailing zero bits shared by all integer-converted elements in each row of $A$ and each column of $B$. If the minimum bound across the rows of $A$ in a tile plus the minimum bound across the columns of $B$ in that tile is at least 8, every product term in the tile is a multiple of $2^8 = 256$. In that case, the kernel skips `matmul2d` for that tile and writes zeros directly.
+
+#### Reducing block products with Strassen's algorithm
+
+For large matrices on the modular path, the library applies one level of Strassen's algorithm, partitioning each matrix into $2 \times 2$ blocks and computing the result with 7 block products instead of 8, when all of the following conditions hold:
+
+- $M \ge 1024$ and $N \ge 1024$
+- $M$ is even, $N$ is a multiple of 128, and $K$ is a multiple of 2048
+- The effective row batch size is at least 128 rows
+
+Each batch processes an equal number of rows from the top and bottom halves of $A$ so that the total number of retained rows stays within `batch_rows`. The Strassen input kernel converts FP64 elements to integers and computes the modular block sums and differences in a single pass, without storing uncombined residue matrices in intermediate buffers. When inner-dimension exponent adjustment is active, each block uses the shifts $d_k$ corresponding to its half of the inner dimension. Likewise, the trailing-zero check for modulus 256 takes the minimum across both blocks participating in each sum or difference.
+
+After the 7 block multiplications finish, a dedicated kernel assembles the 4 output quadrants modulo each $m_t$ before passing them to CRT reconstruction. Because all block additions and subtractions are performed in exact modular arithmetic, integer conversion and final rounding produce the exact same values as standard modular multiplication.
+
+#### CRT reconstruction and rounding to FP64
+
+For CRT reconstruction, the CPU precomputes the basis weights $W_t = (P / m_t)\bigl((P / m_t)^{-1} \bmod m_t\bigr)$ for each modulus $m_t$. Given the output residues $r_t \in [0, m_t)$, the GPU reconstruction kernel evaluates the weighted sum $Y$ as a multi-precision unsigned integer in radix $2^{18}$:
+
+$$
+Y = \sum_t r_t W_t
+$$
+
+Because there are at most 49 moduli and each residue is at most 255, the sum of products for each 18-bit digit plus the incoming carry fits within a 32-bit unsigned integer. Each digit sum can therefore be accumulated independently across all moduli before a single carry-propagation pass.
+
+Next, the kernel approximates the quotient $Y / P$ in FP32 from the precomputed ratios $W_t / P$ and residues $r_t$, selecting the nearest integer $q = \lfloor Y / P + 0.5 \rfloor$. With at most 49 moduli and $r_t \le 255$, the total absolute error introduced by FP32 rounding and summation is less than $0.1$, which guarantees that the exact integer difference $Y - qP$ satisfies $|Y - qP| < P$. If $|Y - qP| > P / 2$, a single subtraction or addition of $P$ yields the exact signed dot product in $(-P/2, P/2)$. Thus, FP32 is used solely to pick the candidate multiple $q$, while value recovery and final rounding to FP64 are performed entirely with exact integer arithmetic.
+
+Reconstruction kernels are compiled for four multi-precision array capacities (4, 8, 12, and 20 digits of 18 bits). At runtime, the CPU selects the smallest capacity that can hold $Y$, preventing GPU threads from carrying unused high-order digits.
 
 ### FP64 fused multiply-add using integer arithmetic
 
-The product of two FP64 significands is computed as an integer of up to 106 bits. Its exponent is aligned with the addend, and addition or subtraction uses a 128-bit integer. Bits shifted below the integer range are represented by a flag in the least significant bit indicating whether any of them were nonzero. This information is used for final rounding. The product alone is never converted to FP64 before rounding the fused result.
+When the FP64 FMA path is selected, threadgroups divide the output matrix into $16 \times 16$ tiles. As threads cooperatively load tiles of $A$ and $B$ into threadgroup shared memory, they unpack each FP64 element into its signed significand and exponent. Multiple output threads in the same row or column reuse the unpacked values from shared memory, avoiding repeated unpacking of the same multiplicands at every FMA step. Terms along the inner dimension are accumulated in input order, and partial tiles at matrix boundaries accumulate only the valid terms. This path writes directly to the output buffer without allocating residue matrices or CRT workspace.
 
-The product and addend are added if their signs agree and subtracted otherwise. For subtraction, the borrow from the highest digit determines the sign. The borrow is expanded into a bit mask to obtain the absolute difference without branching on the sign. Addition and subtraction use the same final-rounding procedure.
+When the initial input analysis confirms that both input matrices contain only finite values, the CPU dispatches a pipeline compiled specifically for finite inputs, omitting per-step NaN and infinity checks on the multiplicands. Overflow during accumulation and subnormal rounding are handled identically in both pipelines.
 
-Significand multiplication is computed directly from 32-bit partial products and carries. Exponent alignment separates 32-bit and 64-bit shifts to avoid indexing an array at variable positions. Final rounding retains two bits immediately below the retained significand. One determines whether the value is at a rounding midpoint, and the other also records whether any lower bits are nonzero. Significand extraction and the rounding decision use the same exponent-alignment result. The rounding increment, either 0 or 1, is computed with bit operations, and integer comparisons determine carries.
+Each fused multiply-add step proceeds as follows:
 
-When input analysis establishes that both matrices are finite, the library uses a pipeline compiled for finite inputs. This avoids checking the multiplicands for NaNs and infinities in every fused multiply-add. Overflow during accumulation and rounding of subnormal results are still handled regardless of the input range.
-
-Threadgroups share the output rows and columns. Inputs are decomposed into signed significands and exponents when loaded into shared memory. Multiple outputs reuse the decomposed values, avoiding repeated decomposition of the same multiplicands in each fused multiply-add. Input order along the inner dimension is preserved. The final batch includes only terms that actually exist. Residue matrices and CRT workspace are not used.
-
-### CPU dispatch
-
-The 64 bits of each input are read as two 32-bit integers. For each analysis, the CPU receives a 12-byte result containing the integer widths and the presence of nonfinite values computed by the GPU. The CPU uses this result to select the compute pipeline and workspace. When CRT is used, the CPU constructs reconstruction coefficients that do not depend on the input values. It does not scan matrix values or compute dot products. GPU completion is awaited before reading the output.
+1. The two 53-bit significands are multiplied directly using 32-bit partial products and carries to form an exact integer of up to 106 bits. The product alone is never rounded to FP64 before addition.
+2. The product and addend exponents are aligned inside 128-bit (four-word) unsigned integers. Exponent alignment separates 64-bit, 32-bit, and sub-32-bit shifts to avoid indexing arrays at variable runtime offsets. Any nonzero bits shifted below the 128-bit range are collapsed into the least significant bit as a sticky bit for final rounding.
+3. The aligned magnitudes are added when the product and addend have the same sign, and subtracted when their signs differ. In subtraction, the borrow from the most significant word determines the sign of the result. Expanding this borrow into a bit mask converts the two's-complement difference into its absolute value without branching on the sign across SIMD lanes.
+4. To round the 128-bit magnitude to FP64, the kernel reuses the exponent-alignment routine to leave two bits immediately below the 53-bit significand: the upper bit indicates a rounding midpoint (guard bit), and the lower bit records whether any lower bits were nonzero (sticky bit). Bitwise operations compute the round-to-nearest-even increment (`0` or `1`), and integer comparisons detect significand carry-out.
 
 ## Requirements and resources
 
-Apple Silicon, macOS 26 or later, an Xcode installation that can compile Metal Shading Language 4, and CMake are required. The minimum CMake version is defined by `cmake_minimum_required` in [CMakeLists.txt](CMakeLists.txt). The CPU implementation uses C11 and Objective-C with ARC. GPU kernels are written in Metal Shading Language. Validation requires Python 3 and a C++ compiler. No external numerical library is required by the implementation. Performance comparisons use macOS Accelerate.
+Building and running the library requires the following environment:
 
-Each matrix dimension must fit in the signed 32-bit integer range supported by Metal tensors. Inputs, outputs, and row and column analysis results are retained for the full matrices. Exponent adjustment additionally retains one 32-bit integer per term in the inner dimension. Analysis arrays are expanded and reused with sufficient capacity for both the rows and columns of each input. The capacity of CRT intermediate arrays depends on the number of moduli and the row batch size. For FP64 fused multiply-add, the row batch setting does not affect workspace size. Failures are classified by return status and accompanied by diagnostic messages. Resource shortages and Metal execution failures do not trigger CPU computation.
+- Hardware: Apple Silicon (`arm64` / `aarch64`)
+- OS: macOS 26.0 or later
+- Build tools: Xcode capable of compiling Metal Shading Language 4 (`-std=metal4.0`), and CMake (minimum version 3.24, specified by `cmake_minimum_required` in [CMakeLists.txt](CMakeLists.txt))
+- Validation tools: Python 3 and a C++11 compiler are used only when building and running the test suite. The library itself requires no external numerical libraries; performance benchmarks compare against the macOS Accelerate framework.
+
+Each matrix dimension $M, N, K$ must fit within the signed 32-bit integer range (`INT_MAX`) supported by Metal tensors. In memory, the FP64 input buffers ($A$ and $B$), the output buffer ($C$), and the row and column analysis buffers are allocated for the full matrix dimensions. When inner-dimension exponent adjustment is performed, the multiplier allocates an additional buffer of $K$ 32-bit integers for the shifts $d_k$, and expands and reuses the analysis buffers so each can hold both the row and column counts of its input matrix. On the CRT path, the capacity of the intermediate residue buffers depends on the number of active moduli and the row batch size (`batch_rows`). On the FP64 FMA path, no intermediate residue buffers are used, so `batch_rows` does not affect workspace size.
+
+Invalid arguments, CPU allocation failures, and Metal resource or execution errors are classified by return status (`apple_fp64_status_t`) and accompanied by a diagnostic message (`apple_fp64_error_t`). When a resource shortage or GPU execution failure occurs, the library reports the failure rather than falling back to CPU computation.
 
 ## Build and validation
 
-If Xcode's Metal Toolchain is not installed, download Apple's additional component first.
+If Xcode's Metal Toolchain is not yet installed, download Apple's additional component first:
 
 ```sh
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-Build the library, Metal kernels, and experimental command-line tool with the following commands:
+Run the following commands to build the library, Metal kernels (`fp64.metallib`), experimental command-line tool (`fp64_metal`), and test suite, and to execute all checks:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -139,56 +203,65 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Validation uses `Fraction` from the Python standard library. For inputs that use CRT, the exact dot product and final rounding are computed independently, whether or not exponents are adjusted. For inputs that remain outside the CRT range after adjustment, and for inputs containing nonfinite values, the exact rational result of each fused multiply-add is rounded to FP64. Every bit of the GPU output is compared with the expected value. Validation covers rounding of normal values, subnormal numbers, overflow, cancellation, NaNs, infinities, and splitting INT32 dot products. Inputs with different numbers of trailing zero bits across rows and columns are also checked.
+In a standalone build, the library, command-line tool, and tests are all built by default. When the repository is included in another project via `add_subdirectory`, `APPLE_FP64_BUILD_TOOLS` defaults to `OFF`, and this project's command-line tool and tests are omitted even if `BUILD_TESTING` is enabled in the parent project. The table below lists the CMake options for selecting what to build.
 
-Exponent-adjustment tests cover terms lost by rounding after each fused multiply-add and cancellation of products outside the FP64 range. They also verify preservation of input information and the sign of zero in the final output when adjusted values have absolute magnitudes below the smallest positive FP64 subnormal number.
+| Build target | CMake options | C++ compiler and Python 3 |
+|---|---|---|
+| Library, command-line tool, and tests | None | Required |
+| Library and command-line tool only | `-DBUILD_TESTING=OFF` | Not required |
+| Library only | `-DBUILD_TESTING=OFF -DAPPLE_FP64_BUILD_TOOLS=OFF` | Not required |
 
-FP64 fused multiply-add using integer arithmetic is compared with CPU `fma` for 20,000 cases covering the full exponent range and cancellation. C tests reuse the same multiplier with different dimensions and input ranges, and check failure diagnostics. Strassen tests compare rectangular products against exact integer expectations, with different numbers of trailing zero bits in the top, bottom, left, and right blocks. The same products are also checked for blocks with different exponents along the inner dimension. A C++ test includes the header, links the library, and verifies a product.
+Running `ctest` executes five verification suites:
 
-Benchmark validation checks the execution order of intervals. It independently aggregates times, speed ratios, and absolute deviations from the reported interval values, then compares them with the displayed summaries.
-
-Library integration is validated from independent C and C++ projects. Both source integration and an installed package moved to a different location are checked for public-header inclusion, linking, Metal-file discovery, and matrix multiplication. Source integration also verifies that enabling `BUILD_TESTING` in the parent does not add this library's command-line tool or tests.
-
-To build only the library and command-line tool, pass `-DBUILD_TESTING=OFF` to CMake. This configuration does not use a C++ compiler or Python.
-
-To build only the library, also pass `-DAPPLE_FP64_BUILD_TOOLS=OFF`. `APPLE_FP64_BUILD_TOOLS` defaults to `ON` for a standalone build and `OFF` when included in another project. Tests are built only in a standalone build with `BUILD_TESTING` enabled. The command-line tool required by those tests is also built in that case.
+1. Exact rational verification (`exact_matrix_products`): Uses `fractions.Fraction` from the Python standard library to compare every bit of the GPU output against an independently computed reference. For inputs handled by CRT (with or without exponent adjustment), it computes the exact rational dot product and rounds once to FP64; for inputs that exceed the CRT range after adjustment or contain nonfinite values, it rounds the exact rational result of each FMA step to FP64. Test cases cover normal rounding, ties-to-even midpoints, subnormals, overflow, cancellation, NaNs, infinities, splitting long INT32 dot products ($K = 131073$), varying trailing zero bits across rows and columns, and exponent adjustments where scaled values fall below the smallest positive FP64 subnormal or where out-of-range products cancel.
+2. Fused multiply-add unit verification (`fused_multiply_add`): Compares the integer-based FP64 FMA implementation against CPU hardware `fma` across 20,000 cases spanning the full exponent range and cancellation patterns.
+3. Multiplier reuse and Strassen verification (`repeated_matrix_products`, `cpp_matrix_product`): Reuses a single `apple_fp64_multiplier_t` across varying dimensions, batch sizes, and exponent ranges, and verifies failure diagnostics for invalid arguments and unreadable `.metallib` paths. It also tests Strassen multiplication on large rectangular matrices ($1026 \times 1152 \times 2048$) whose top, bottom, left, and right blocks have different trailing zero counts and different inner-dimension exponents, comparing every output bit against exact integer expectations. In addition, a C++ test includes the public header, links the library, and verifies a matrix product.
+4. Benchmark output verification (`benchmark_measurements`): Runs the `benchmark` subcommand, checks that intervals execute in the specified alternating order, and independently recomputes interval means, trial speed ratios, medians, minimums and maximums, and median absolute deviations from the printed interval timings to verify the displayed summaries.
+5. External consumer verification (`library_consumers`): Builds and runs independent C and C++ CMake projects that consume the library both via `add_subdirectory` and via `find_package(AppleSiliconFP64 CONFIG REQUIRED)` after installing and moving the package to a new directory, verifying header inclusion, linking, `fp64.metallib` discovery, and matrix multiplication.
 
 ## Command-line usage
 
-For square matrices, the benchmark compares Accelerate's `cblas_dgemm` with AppleSilicon-FP64. The arguments are the matrix order followed by the number of measurement trials.
+The `fp64_metal` executable provides two subcommands: `benchmark` for performance comparisons against Accelerate, and `multiply` for computing products of matrices stored in binary files.
+
+### Running benchmarks (`benchmark`)
+
+For square matrices of order $N$, the `benchmark` subcommand compares Accelerate's `cblas_dgemm` with `AppleSilicon-FP64`. The arguments are the matrix order $N$ followed by the number of measurement trials (defaulting to $N = 512$ and $5$ trials when omitted):
 
 ```sh
 ./build/fp64_metal benchmark 512 5
 ```
 
-Initialization and warmup are excluded from repeated measurements. Warmup alternates between the two methods until each has accumulated at least 0.25 seconds of execution and completed at least two intervals. Within each interval, the same input matrices are multiplied repeatedly. The most recent warmup time is used to determine a repetition count for each method that makes an interval last approximately 0.05 seconds. If a single multiplication takes longer, the repetition count is one. Repetition counts are fixed after warmup and are not adjusted in response to measurements.
+Multiplier initialization and warmup are excluded from the repeated trial measurements. During warmup, the tool alternates between the two methods until each has accumulated at least 0.25 seconds of execution time and completed at least two intervals. Within each interval, the same input matrices are multiplied repeatedly. From the most recent warmup duration, the tool chooses a repetition count for each method so that one interval lasts approximately 0.05 seconds (or 1 repetition if a single multiplication takes 0.05 seconds or longer). Repetition counts are fixed once warmup ends.
 
-Each trial measures both methods twice. The interval order is shown below.
+Each measured trial runs both methods twice (four intervals in total). To balance system and thermal drift, odd and even trials alternate the interval order. The execution order of the four intervals in each trial is shown in the table below.
 
 | Trial | First interval | Second interval | Third interval | Fourth interval |
 |---|---|---|---|---|
 | Odd-numbered | Accelerate | AppleSilicon-FP64 | AppleSilicon-FP64 | Accelerate |
 | Even-numbered | AppleSilicon-FP64 | Accelerate | Accelerate | AppleSilicon-FP64 |
 
-Both methods time each complete interval using a monotonic clock on the calling side. Dividing by the repetition count gives the wall-clock time per matrix product. AppleSilicon-FP64 includes the time needed to release the result of each repetition. Input analysis and conversion run on every repetition. Workspace and output allocation, input copies, and synchronization are also included. Accelerate reuses a preallocated output array. The GPU writes directly into the output storage returned to the caller.
+Both methods time each complete interval using a monotonic clock (`CLOCK_MONOTONIC`) on the calling thread and divide by the repetition count to obtain the wall-clock time per matrix product.
 
-For each trial, the two interval times are averaged separately for each method. The trial's speed ratio is the Accelerate average divided by the AppleSilicon-FP64 average. Median, minimum, and maximum values are reported for each method's time and for the trial speed ratios. For each method's time, the median absolute deviation from the median is also reported as a percentage of the median time. Individual interval values and their execution order are printed. No outliers are excluded.
+- For `AppleSilicon-FP64`, every repetition runs a full `apple_fp64_multiply` call, including input analysis and conversion, workspace and output allocation, input copies, and GPU completion wait, followed by releasing the returned result buffer with `apple_fp64_result_destroy`. The GPU writes directly into the page-aligned output storage returned to the caller.
+- For `Accelerate`, every repetition writes into a preallocated output array reused across the benchmark.
 
-Input-conversion time is GPU execution time and includes input analysis. Matrix-multiplication and reconstruction times are also GPU execution times. CPU wait time overlaps GPU execution, so the sum of the individual timings does not equal the overall wall-clock time. The output labeled `Accelerateとの最大絶対差` (“maximum absolute difference from Accelerate”) is the difference for the benchmark inputs, not an accuracy guarantee.
+For each trial, the two interval times for each method are averaged, and the trial's speed ratio is computed by dividing the `Accelerate` trial mean by the `AppleSilicon-FP64` trial mean. After all trials complete, the tool prints the individual interval timings in execution order without excluding outliers, and reports the median, minimum, and maximum for each method's trial time and for the trial speed ratios. As a measure of timing variability, it also reports the median absolute deviation from the median divided by the median time, expressed as a percentage.
 
-Arbitrary matrices can be supplied as binary files containing row-major FP64 values, without a header. Each element is stored in little-endian IEEE 754 binary64 format. The arguments are $`M,N,K`$, the two input files, and the output file, in that order. An optional final argument specifies the row batch size.
+The stage timings reported for `AppleSilicon-FP64` (input conversion including input analysis, GPU matrix multiplication, and reconstruction) are GPU execution times obtained from Metal command buffer timestamps. Because CPU wait time overlaps with GPU execution, the sum of these stage times does not equal the overall wall-clock time. The line labeled `Accelerateとの最大絶対差` ("maximum absolute difference from Accelerate") reports the largest elementwise difference observed on the benchmark input matrices and does not represent a general accuracy bound across arbitrary inputs.
+
+### Multiplying binary matrix files (`multiply`)
+
+To multiply arbitrary matrices from files, supply headerless binary files containing contiguous row-major IEEE 754 binary64 (FP64) values in little-endian byte order. The arguments are the dimensions $M, N, K$, the two input files `A.bin` and `B.bin`, and the output file `C.bin`, followed by an optional positive integer specifying the row batch size (`batch_rows`):
 
 ```sh
 ./build/fp64_metal multiply 128 96 64 A.bin B.bin C.bin 256
 ```
 
-If a file's length does not match its dimensions, the command writes the reason to standard error and exits with status 1. The output file is not opened until computation has completed successfully.
-
-The CPU reads the command-line tool's input files. NaNs and infinities are accepted. Their numerical treatment is defined in “Numerical semantics.”
+The CPU reads the input files, which may contain any valid FP64 bit patterns including NaNs and infinities. If an input file's byte size does not match $M \times K \times 8$ or $K \times N \times 8$, or if computation fails, the tool writes the reason to standard error and exits with status `1` without opening the output file `C.bin`.
 
 ## Benchmark results and performance
 
-The following table lists the conditions used for measurements with the `benchmark` command. “Command-line usage” describes which operations are included in the measurements and which are excluded.
+The table below lists the environment and configuration used for measurements with the `benchmark` subcommand.
 
 | Item | Condition |
 |---|---|
@@ -199,11 +272,11 @@ The following table lists the conditions used for measurements with the `benchma
 | Power | AC power. |
 | Runtime settings | Environment variables controlling Accelerate's thread count and Metal validation were unset. |
 | Concurrent activity | OS background tasks and desktop applications were running. |
-| Input | FP64 square matrices generated from a uniform distribution over [-1, 1), with random seed 123. |
+| Input | FP64 square matrices generated from a uniform distribution over $[-1, 1)$, with random seed `123`. |
 | Integer widths | Determined automatically from the inputs. |
 | Row batch size | 256 rows. |
 
-For each matrix order, three sets of seven trials are run in separate processes. The tables aggregate the trial values defined in “Command-line usage.” The representative value is the median of all 21 trials. Parentheses contain the minimum and maximum over all 21 trials. No outliers are excluded. Time ranges describe trial averages, not the latency range of individual calls. The measurements can be reproduced with the following commands:
+For each matrix order $N$, three sets of seven trials (21 trials in total) were run in separate processes. Representative values in the tables are the medians across all 21 trials, with minimums and maximums over all 21 trials shown in parentheses. No outliers were excluded. Note that the minimum and maximum values represent the range of trial means rather than single-call latencies. The measurements can be reproduced with the following commands:
 
 ```sh
 for series in 1 2 3; do
@@ -213,9 +286,9 @@ for series in 1 2 3; do
 done
 ```
 
-Metal initialization took 28.0–46.3 ms in measurements with the ordinary inputs.
+In measurements with the ordinary uniform inputs, Metal initialization took 28.0–46.3 ms.
 
-The following table shows overall wall-clock times and AppleSilicon-FP64's effective throughput. Speed ratios are also aggregated from individual trial ratios, so they generally differ from the ratio of the median times. A ratio greater than 1 means AppleSilicon-FP64 is faster. Effective GFLOP/s is calculated from the median overall wall-clock time, using $`2N^3`$ as the operation count for a square matrix product of order $`N`$.
+Because speed ratios are aggregated from individual trial ratios, the median speed ratio generally differs slightly from the ratio of the two methods' median times. A speed ratio greater than `1` indicates that `AppleSilicon-FP64` is faster than `Accelerate`. Effective GFLOP/s is computed from the median overall wall-clock time using $2N^3$ operations for a square matrix product of order $N$. The following table shows the overall wall-clock times, trial speed ratios, and effective throughput of `AppleSilicon-FP64` on the ordinary inputs.
 
 | Order | Accelerate (ms) | AppleSilicon-FP64 (ms) | Speed ratio | AppleSilicon-FP64 effective GFLOP/s |
 |---:|---:|---:|---:|---:|
@@ -227,7 +300,7 @@ The following table shows overall wall-clock times and AppleSilicon-FP64's effec
 | 4096 | 192.5540 (188.0395–196.9010) | 173.3290 (170.8985–175.3040) | 1.112 (1.092–1.132) | 792.9 |
 | 8192 | 1534.8580 (1514.8270–1583.9300) | 1337.1440 (1300.7025–1369.6780) | 1.152 (1.119–1.171) | 822.3 |
 
-The following table shows timing variability across all 21 trials. The median absolute deviation is the percentage defined in “Command-line usage.” Because it is less affected by a small number of large fluctuations, it should be considered together with the minimum and maximum times.
+Because the median absolute deviation from the median divided by the median time (%) is insensitive to a small number of large fluctuations, it should be read alongside the minimum and maximum trial times in the overall wall-clock time table. The table below shows timing variability across all 21 trials.
 
 | Order | Accelerate median absolute deviation (%) | AppleSilicon-FP64 median absolute deviation (%) |
 |---:|---:|---:|
@@ -239,7 +312,7 @@ The following table shows timing variability across all 21 trials. The median ab
 | 4096 | 0.703 | 0.607 |
 | 8192 | 0.434 | 1.152 |
 
-The following table breaks down GPU execution time and resource usage. Each component time uses the same aggregation method as the overall wall-clock time. Metal workspace is the sum of the capacities of the Metal buffers used for computation. CPU input arrays and other allocations consume additional memory.
+Metal workspace is the sum of the capacities of the Metal buffers used for computation; CPU input arrays and other host allocations consume additional memory. The following table breaks down the median GPU execution time by stage, the number of moduli selected, and the total Metal workspace capacity.
 
 | Order | Input conversion (ms) | GPU matrix multiplication (ms) | Reconstruction (ms) | Modulus count | Metal workspace (MiB) |
 |---:|---:|---:|---:|---:|---:|
@@ -251,15 +324,13 @@ The following table breaks down GPU execution time and resource usage. Each comp
 | 4096 | 7.584 | 152.796 | 10.663 | 16 | 904.132 |
 | 8192 | 38.097 | 1219.881 | 41.564 | 16 | 3472.226 |
 
-Across all measured cases with ordinary inputs, the maximum absolute difference from Accelerate was `1.492e-12`.
+Across all measured orders with the ordinary uniform inputs, the maximum absolute difference from `Accelerate` was `1.492e-12`.
 
 ### Inputs with a wide exponent range
 
-Matrices generated from the same random values as the ordinary inputs are transformed so that exponents alternate along the inner dimension. For even $`k`$, column $`k`$ of A is multiplied by $`2^{-500}`$ and row $`k`$ of B by $`2^{500}`$. For odd $`k`$, the factors are reversed. The exponent changes cancel in each product, widening the input exponent range without changing the magnitude of the result.
+To evaluate inputs whose exponents span a wide range but cancel along the inner dimension, matrices generated from the same random sequence were scaled by alternating powers of two: for even $k$, column $k$ of $A$ is multiplied by $2^{-500}$ and row $k$ of $B$ by $2^{500}$; for odd $k$, the factors are reversed ($2^{500}$ and $2^{-500}$). Because the scaling factors cancel in every product $A_{ik} B_{kj}$, this transformation widens the input exponent range by $2^{1000}$ without changing the magnitude of the exact result. To examine whether element signs affect performance or accuracy, matrices of order 512 and above were also measured after taking the absolute value of every random element prior to applying the same exponent scaling.
 
-To examine the effect of signs, matrices of order 512 and above are also measured after taking the absolute value of every random element and applying the same exponent transformation.
-
-These inputs are passed to the public C API and measured using the same warmup, repetition-count selection, interval order, and aggregation method as in “Command-line usage.” Each input condition is measured in three sets of seven trials. The following table gives the medians and ranges over all 21 trials. Exponent adjustment selected CRT for every input. GPU matrix-multiplication time covers only the multiplication itself, excluding input conversion and reconstruction.
+These inputs were passed to the public C API and measured across three sets of seven trials (21 trials in total) using the same warmup, repetition-count selection, alternating interval schedule, and aggregation rules as the `benchmark` subcommand. In every case, inner-dimension exponent adjustment reduced the integer widths enough to select the CRT path. Note that "GPU matrix multiplication" reports only the matrix-multiplication kernel time, excluding input conversion and reconstruction. The table below gives the medians and ranges across all 21 trials for inputs with canceling inner-dimension exponents.
 
 | Order | Input signs | Accelerate (ms) | AppleSilicon-FP64 (ms) | GPU matrix multiplication (ms) | Modulus count | AppleSilicon-FP64 median absolute deviation (%) | Metal workspace (MiB) |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -277,67 +348,65 @@ These inputs are passed to the public C API and measured using the same warmup, 
 | 8192 | Mixed positive and negative | 1538.281500 (1511.738500–1694.330500) | 1356.759500 (1307.479000–1777.079000) | 1225.263 | 16 | 1.966 | 3472.257 |
 | 8192 | Nonnegative | 1534.375000 (1519.494000–1541.803500) | 1342.934500 (1311.778500–1390.592000) | 1224.072 | 16 | 1.198 | 3472.257 |
 
-The maximum absolute differences from Accelerate for these measured inputs were `1.492e-12` with mixed signs and `2.501e-11` with nonnegative values. These values do not guarantee accuracy for other inputs or dimensions. The numerical conditions are defined in “Numerical semantics.”
+For these measured inputs, the maximum absolute differences from `Accelerate` were `1.492e-12` with mixed signs and `2.501e-11` with nonnegative values.
 
-A matrix of order 1024 is also measured with exponents alternating along both the row and column dimensions, as an example where exponent adjustment does not reduce the integer widths. Row and column indices start at 0. When the sum of the indices is even, elements of A are multiplied by $`2^{-500}`$ and elements of B by $`2^{500}`$; when it is odd, the factors are reversed. The same random inputs with mixed signs are used. Each column of A and each row of B then contains both large and small values.
+As an example where inner-dimension exponent adjustment cannot narrow the integer widths, a matrix of order 1024 was also measured with exponents alternating in a checkerboard pattern across both rows and columns. Using 0-based row and column indices, when the sum of the row and column indices is even, elements of $A$ are multiplied by $2^{-500}$ and elements of $B$ by $2^{500}$; when the sum is odd, the factors are reversed. Because every column of $A$ and every row of $B$ contains both $2^{-500}$-scaled and $2^{500}$-scaled elements, adjusting exponents along the inner dimension leaves the integer widths unchanged.
 
-The following table shows the results from three sets of seven trials under the same conditions. Input analysis includes exponent adjustment and repeated analysis. The modulus count is 0, indicating that FP64 fused multiply-add is used.
+Three sets of seven trials (21 trials in total) were measured under the same conditions using the mixed-sign random inputs. "Input analysis" includes the time spent computing exponent adjustments and re-running the row and column analysis. The modulus count is `0`, indicating that the library selected the integer-based FP64 FMA path. The table below shows the measurement results for the 1024-order checkerboard-exponent input.
 
 | Order | Accelerate (ms) | AppleSilicon-FP64 (ms) | Input analysis (ms) | GPU fused multiply-add (ms) | AppleSilicon-FP64 median absolute deviation (%) | Metal workspace (MiB) |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1024 | 2.959889 (2.899500–3.062088) | 49.129750 (48.067250–50.277250) | 0.353 | 47.206 | 0.913 | 24.027 |
 
-The maximum absolute difference from Accelerate for this input was 0.
+For this input, the maximum absolute difference from `Accelerate` was `0`.
 
 ### Discussion
 
 #### Matrix size and comparison results
 
-With ordinary inputs, Accelerate is faster in all 21 trials for matrices up to order 2048. AppleSilicon-FP64 is faster in all 21 trials at orders 4096 and 8192.
+With the ordinary uniform inputs, `Accelerate` is faster in all 21 trials for matrices up to order 2048, whereas `AppleSilicon-FP64` is faster in all 21 trials at orders 4096 and 8192.
 
-Doubling the order increases the operation count of conventional square matrix multiplication by a factor of eight. AppleSilicon-FP64's overall wall-clock time increases by approximately 6.94 times from order 2048 to 4096, and by approximately 7.71 times from order 4096 to 8192. The measured cases at order 2048 and above use Strassen's algorithm as described in “Matrix multiplication using integer residues.” However, the number of moduli also changes with the dimensions, so measurements at different dimensions cannot establish the speedup attributable to Strassen's algorithm alone.
+Doubling the order of a square matrix increases the operation count of standard matrix multiplication by a factor of 8. By comparison, the median overall wall-clock time of `AppleSilicon-FP64` increases by a factor of approximately 6.94 from order 2048 to 4096, and by approximately 7.71 from order 4096 to 8192. Orders 2048 and above use the one-level Strassen algorithm described in "Matrix multiplication using integer residues." However, because the number of active moduli also changes with the matrix dimensions, comparing timings across different orders does not isolate the speedup of Strassen's algorithm alone.
 
-The tables compare overall wall-clock times when API calls reuse a multiplier. Creating a multiplier for every call adds initialization cost. Accelerate uses a preallocated output array, so the two APIs require different work. The operations included in the measurements are defined in “Command-line usage.”
+Note that the tables compare wall-clock times when calls reuse an existing `apple_fp64_multiplier_t`. Creating a new multiplier on every call would add Metal initialization overhead (28.0–46.3 ms). In addition, `Accelerate` writes into a preallocated output array, whereas `AppleSilicon-FP64` allocates and releases the output buffer on every call, so the two APIs perform different per-call memory management work.
 
 #### Input analysis and small matrices
 
-To determine integer widths that preserve the inputs without loss, the GPU analyzes the inputs, and the CPU receives the results before selecting a computation method. This synchronization occurs on every API call. Omitting input analysis could lose small terms when matrices with different exponent ranges are passed to the same multiplier.
+To determine integer widths that preserve all input bits without loss, `AppleSilicon-FP64` analyzes the inputs on the GPU and synchronizes with the CPU to select a pipeline on every call. Skipping this per-call analysis would risk truncating smaller terms when matrices with different exponent distributions are passed to the same multiplier.
 
-At order 128, the sum of the representative GPU component times is approximately 19% of the representative overall wall-clock time. When the amount of computation is small, dispatch, synchronization, and output allocation are likely to account for a substantial fraction of the cost. However, the representative values do not come from the same trial, so their difference from the overall time cannot be treated as CPU time.
+At order 128, the sum of the median GPU stage times accounts for only about 19% of the median overall wall-clock time. When the total computation volume is small, fixed overheads (command encoding, CPU-GPU synchronization, and output buffer allocation and deallocation) represent a large share of the total elapsed time. Because the median stage times and the median overall time are not necessarily drawn from the same individual trial, their difference cannot be interpreted directly as exact CPU execution time.
 
 #### Large matrices and memory
 
-At order 8192, matrix multiplication using residues accounts for approximately 94% of the sum of the representative GPU component times. Performance for large matrices strongly depends on how efficiently matrix products are computed for the required moduli. Because integer widths are determined from the inputs, the number of required moduli depends on the input values.
+At order 8192, INT8 modular matrix multiplication accounts for approximately 94% of the sum of the median GPU stage times. Consequently, throughput for large matrices depends primarily on how efficiently the GPU executes the required number of modular matrix products. Because the integer widths are derived from the input values, the number of moduli, and thus the total multiplication work, varies with the input distribution.
 
-Metal workspace increases by approximately 3.84 times from order 4096 to 8192. FP64 input and output buffers and the intermediate array for B are required for the full matrices. Reducing the row batch size therefore does not reduce total capacity in the same proportion. Changing the row batch size also affects whether Strassen's algorithm is used. Both time and capacity need to be measured when choosing this setting.
+Total Metal workspace increases by a factor of approximately 3.84 from order 4096 to 8192. Because the FP64 input and output buffers and the residue buffer for $B$ must cover the full matrices, reducing `batch_rows` does not shrink total memory usage in the same proportion. Furthermore, setting `batch_rows` below 128 disables Strassen's algorithm, so both execution time and memory footprint should be measured when tuning `batch_rows`.
 
 #### Accuracy and scope of measurement
 
-The measured ordinary inputs and the inputs whose exponents cancel along the inner dimension use CRT, without truncation during conversion to integers. Differences from Accelerate arise from different rounding orders and counts in the dot products. Repeated measurements with the same inputs do not increase the variety of inputs checked for accuracy. Numerical validation compares outputs with independent reference values as described in “Build and validation.”
+Both the ordinary uniform inputs and the inputs whose exponents cancel along the inner dimension use the CRT path, which converts inputs to integers without truncation and rounds the exact dot product once to FP64. For these inputs, differences from `Accelerate` arise solely from the difference between rounding once at the end of the dot product and rounding repeatedly during accumulation.
 
-Inputs that remain outside the CRT range after exponent adjustment use FP64 fused multiply-add. This method rounds after each fused multiply-add, so cancellation can produce large relative errors. Small absolute differences measured with ordinary inputs cannot be used as an accuracy guarantee over a wide exponent range. The numerical semantics are defined in “Numerical semantics.”
+By contrast, inputs that still exceed the CRT range after exponent adjustment fall back to the sequential FP64 FMA path. Because that path rounds after every FMA step, catastrophic cancellation during accumulation can produce larger relative errors. Small absolute differences observed on inputs that use CRT therefore do not imply equivalent accuracy on arbitrary wide-exponent inputs that fall back to sequential FMA.
 
 #### Performance over a wide exponent range
 
-Performance is not determined solely by the overall input exponent range. When changes in the exponents of A and B cancel along the inner dimension, adjustment can reduce the widths sufficiently for lossless integer conversion, allowing INT8 matrix multiplication and CRT. The measured inputs use the same number of moduli as the ordinary inputs, and processing times for large matrices are also close to those for ordinary inputs.
+Overall performance is not dictated by the global exponent span of the matrices alone. When opposing exponent changes in $A$ and $B$ cancel along the inner dimension, exponent adjustment narrows the required integer widths enough for lossless integer conversion, enabling the fast INT8 matrix multiplication and CRT path. On the measured canceling-exponent inputs, the library selected the same number of moduli (15 or 16) as on ordinary inputs and achieved similar large-matrix execution times.
 
-At orders 4096 and 8192 with canceling exponents, the median speed ratios from paired trials show that AppleSilicon-FP64 is approximately 1.09–1.14 times faster than Accelerate. However, some trials at order 8192 with mixed signs were slower than Accelerate. Performance estimates need to consider the reported ranges as well as the medians.
+At orders 4096 and 8192 with canceling exponents, the median trial speed ratios show that `AppleSilicon-FP64` is approximately 1.09–1.14 times faster than `Accelerate`. However, at order 8192 with mixed signs, some trials ran slower than `Accelerate` (up to 1777.079 ms), so performance estimates should account for the full observed range rather than the median alone.
 
-Exponent adjustment requires additional input analysis and synchronization for the CPU to receive the analysis results. For small matrices, this cost is large relative to the amount of computation. If adjustment cannot bring the inputs within the CRT range, FP64 fused multiply-add is performed after paying the analysis cost, and exponent adjustment provides no speedup.
+Exponent adjustment adds one extra pass of GPU analysis and CPU synchronization. For small matrices, this extra pass represents a noticeable fraction of the total runtime. Moreover, when exponents vary across both rows and columns so that adjustment cannot bring the integer widths within the CRT range (as in the 1024-order checkerboard input), the library pays the cost of the extra analysis pass and then runs the slower FP64 FMA path, yielding no speedup from exponent adjustment.
 
-CRT requires residue matrices and reconstruction workspace. The size of the exponent-adjustment array alone does not determine memory use for inputs with a wide exponent range. Both the selected computation method and the modulus count derived from the inputs need to be considered.
-
-These measurements apply to the stated environment and inputs. Performance on other GPUs or inputs needs to be measured under the corresponding conditions.
+Memory usage on wide-exponent inputs likewise depends on whether the adjusted inputs fit within the CRT range (which allocates residue and reconstruction buffers according to the modulus count) or fall back to the FMA path. Finally, all reported numbers reflect the hardware, software, and input distributions specified in this section; performance on other Apple Silicon GPUs or input distributions should be measured under the target conditions.
 
 ## Using the library from C and C++
 
-Public types, input and output conditions, ownership, and failure behavior are defined in `include/apple_fp64/matmul.h`. The header applies `extern "C"` when included from C++. No C++ wrapper is required to use the library.
+Public types, input and output preconditions, memory ownership rules, and failure behavior are defined in `include/apple_fp64/matmul.h`. Because the header applies `extern "C"` automatically when included in C++, C++ applications can call the API directly without a wrapper.
 
-Doxygen comments contain Japanese and English descriptions. Set `OUTPUT_LANGUAGE` to `Japanese` or `English` to output the selected language using [Doxygen's language filter](https://www.doxygen.nl/manual/commands.html#cmdtilde).
+The Doxygen comments in `include/apple_fp64/matmul.h` include both Japanese and English descriptions. By setting `OUTPUT_LANGUAGE` to `Japanese` or `English` in your Doxygen configuration, you can generate documentation in either language using [Doxygen's language filter](https://www.doxygen.nl/manual/commands.html#cmdtilde).
 
-An `apple_fp64_multiplier_t` retains Metal pipelines and workspace, allowing the same multiplier to be reused for multiple products. Larger workspace is allocated only when existing capacity is insufficient.
+An `apple_fp64_multiplier_t` instance retains compiled Metal pipelines and workspace buffers so that the same multiplier can be reused across multiple products. Workspace buffers are reallocated only when a call requires more capacity than is currently allocated.
 
-The following example compiles as either C or C++:
+The following example compiles as both C and C++:
 
 ```c
 #include <apple_fp64/matmul.h>
@@ -373,43 +442,41 @@ int main(int argc, char **argv)
 
 ### Integrating from source
 
-Add the source directory to the consuming project's `CMakeLists.txt`:
+Add this repository's source directory to your project's `CMakeLists.txt` using `add_subdirectory`:
 
 ```cmake
 add_subdirectory(path/to/AppleSilicon-FP64 apple-fp64)
 ```
 
-By default, this builds only the library and the required Metal kernels. The consuming project does not need a C++ compiler or Python to build the library. A consuming application written in C++ still needs a C++ compiler.
+By default, this builds only the static library and the compiled Metal shader library (`fp64.metallib`). A C project consuming the library this way does not need a C++ compiler or Python 3.
 
 ### Installing and using the package
 
-Install the library built with the procedure in “Build and validation” into the chosen directory:
+You can also install the library built with the commands in "Build and validation" into a prefix directory of your choice:
 
 ```sh
 cmake --install build --prefix /path/to/apple-fp64
 ```
 
-The installation contains the static library, public header, Metal file, CMake package configuration, and LICENSE. The experimental command-line tool and tests are not installed.
+The installation includes the static library, public header, `fp64.metallib`, CMake package configuration files, and `LICENSE` (the experimental command-line tool and tests are not installed). The installed directory is relocatable and can be moved to another path intact.
 
-Find the package in the consuming project's `CMakeLists.txt`:
+In the consuming project's `CMakeLists.txt`, load the package with `find_package`:
 
 ```cmake
 find_package(AppleSiliconFP64 CONFIG REQUIRED)
 ```
 
-Add the installation directory to the search path when configuring that project:
+When configuring the consuming project, pass the installation path (or its new location if moved) via `CMAKE_PREFIX_PATH`:
 
 ```sh
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/apple-fp64
 ```
 
-The entire installation directory can be moved without breaking the package. After moving it, specify its new location in the search path.
-
 ### Linking and deploying the Metal file
 
-For either integration method, link `AppleSiliconFP64::apple_fp64`. The target propagates the public-header search path and the Metal and Foundation link settings to the consuming project. `AppleSiliconFP64_METALLIB` contains the absolute path to the corresponding `fp64.metallib`. When integrating from source, this file is generated during the build.
+With either integration method, link against `AppleSiliconFP64::apple_fp64`. This target automatically propagates the public header include path and the `-framework Metal` and `-framework Foundation` link flags. In addition, the CMake variable `AppleSiliconFP64_METALLIB` provides the absolute path to the generated or installed `fp64.metallib` file.
 
-For a command-line application, the following example copies the Metal file into the executable's directory:
+For a command-line executable, you can copy `fp64.metallib` next to the built binary with a post-build command in `CMakeLists.txt`:
 
 ```cmake
 add_executable(my_app main.c)
@@ -421,7 +488,7 @@ add_custom_command(TARGET my_app POST_BUILD
     VERBATIM)
 ```
 
-For a macOS application, include the Metal file as a resource in the application bundle. At runtime, obtain its deployed path and pass it to `apple_fp64_multiplier_create`. The library does not search for the file automatically. Use a path that does not depend on the current working directory.
+For a macOS application bundle (`.app`), package `fp64.metallib` as a bundle resource, resolve its runtime path from the bundle, and pass that path to `apple_fp64_multiplier_create`. Because the library does not search for `fp64.metallib` automatically, always pass a path that does not depend on the process's current working directory.
 
 ## License
 
@@ -429,4 +496,4 @@ Usage terms are defined in [LICENSE](LICENSE).
 
 ## References
 
-The numerical background is described in the [original paper on Ozaki Scheme II](https://arxiv.org/abs/2504.08009). Integer-based CRT reconstruction and construction of FP64 bit patterns are adapted for Apple Silicon. Matrix multiplication in Metal uses [Apple's description of Metal 4](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4) and the integer type combinations defined in `MPPTensorOpsMatMul2d.h` in the Xcode SDK.
+The theoretical background for the modular matrix multiplication method is presented in the [original paper on Ozaki Scheme II](https://arxiv.org/abs/2504.08009). Multi-precision integer CRT reconstruction and direct construction of rounded FP64 bit patterns are designed specifically for Apple Silicon GPUs. INT8 matrix multiplication on Metal uses [Apple's Metal 4 documentation](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4) and the integer type combinations defined in `MPPTensorOpsMatMul2d.h` in the Xcode SDK.

@@ -6,16 +6,16 @@
 
 /**
  * @~japanese
- * @brief C++からCのヘッダーを使い、計算器と結果を操作する。
+ * @brief C++から公開Cヘッダーをインクルードし、計算器の作成と行列積の実行ができるか検証する。
  * @param[in] argc 引数の個数。
- * @param[in] argv Metalライブラリーのパスを含む引数。
- * @return C++から行列積を利用できた場合は0。
+ * @param[in] argv Metalライブラリーのパスを含むコマンドライン引数。
+ * @return C++から行列積を正しく実行できた場合は0、それ以外は1。
  * @pre argcは2であること。
  * @~english
- * @brief Use the C header from C++ to manage the multiplier and result.
+ * @brief Include the public C header from C++ and verify multiplier creation and matrix multiplication.
  * @param[in] argc Number of arguments.
- * @param[in] argv Arguments including the Metal library path.
- * @return Zero if matrix multiplication was usable from C++.
+ * @param[in] argv Command-line arguments including the Metal library path.
+ * @return Zero if matrix multiplication succeeds from C++, otherwise one.
  * @pre argc must be 2.
  * @~
  */

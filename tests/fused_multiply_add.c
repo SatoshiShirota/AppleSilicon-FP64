@@ -7,13 +7,13 @@
 
 /**
  * @~japanese
- * @brief 全指数範囲のビット列を作るための乱数の状態を進める。
- * @param[in,out] state 非ゼロの乱数の状態。
- * @return 次の64ビットの値。
+ * @brief 指数部と仮数部のあらゆるビットパターンを生成するため、乱数生成器の状態を進める。
+ * @param[in,out] state 非ゼロの乱数状態。
+ * @return 次の64ビット乱数値。
  * @~english
- * @brief Advance the random state used to generate bit patterns across the full exponent range.
- * @param[in,out] state Nonzero random state.
- * @return Next 64-bit value.
+ * @brief Advance the random number generator state to produce bit patterns across the full exponent and significand range.
+ * @param[in,out] state Non-zero generator state.
+ * @return Next 64-bit random value.
  * @~
  */
 static uint64_t fp64_next_bits(uint64_t *state)
@@ -26,11 +26,11 @@ static uint64_t fp64_next_bits(uint64_t *state)
 
 /**
  * @~japanese
- * @brief CPUとGPUで共有する積和演算を、CPUのFP64の積和演算と比較する。
- * @return ビット列が一致した場合は0。
+ * @brief CPUとGPUで共有するソフトウェアFMA実装の出力を、標準Cライブラリーのfma関数の結果とビット単位で比較する。
+ * @return すべてのテストケースでビット列が一致した場合は0、不一致があった場合は1。
  * @~english
- * @brief Compare fused multiply-add shared by the CPU and GPU against CPU FP64 fused multiply-add.
- * @return Zero if the bit patterns match.
+ * @brief Compare the output of the software FMA implementation shared between CPU and GPU bit-for-bit against standard C fma.
+ * @return Zero if all test cases match bit-for-bit, otherwise one.
  * @~
  */
 int main(void)

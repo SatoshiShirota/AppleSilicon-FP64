@@ -1,4 +1,4 @@
-"""ベンチマークの実行順序と、区間の実測値から得る集計を検証する。"""
+"""ベンチマークの各区間の実行順序と、測定値から算出される統計量を検証する。"""
 
 import math
 import re
@@ -8,7 +8,7 @@ import sys
 
 
 def main() -> None:
-    """二試行の出力を独立に集計し、表示された時間と速度比を照合する。"""
+    """2試行分のベンチマーク出力を独自に集計し、表示された実行時間や速度比と一致するか照合する。"""
     output = subprocess.run(
         [sys.argv[1], "benchmark", "128", "2"],
         check=True, capture_output=True, text=True, timeout=30,
@@ -30,7 +30,7 @@ def main() -> None:
             times[name].append(statistics.mean(samples))
         numerator, denominator = (times[name][-1] for name in names)
         ratio = numerator / denominator
-        # 区間の表示はミリ秒の小数点以下六桁へ丸められている。
+        # 各区間の表示値はミリ秒単位で小数点以下6桁に丸められているため、その丸め誤差を見込む。
         tolerance = 0.0000005 * (1 + ratio) / denominator + 0.0000005
         assert math.isclose(float(reported_ratio), ratio, abs_tol=tolerance), output
         ratios.append(float(reported_ratio))

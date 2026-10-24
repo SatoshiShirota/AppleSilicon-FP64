@@ -1,4 +1,4 @@
-"""公開コマンドの数値結果を、有理数による独立した計算で検証する。"""
+"""コマンドラインツール（fp64_metal）の計算結果を、有理数演算による独立した期待値とビット単位で比較する。"""
 
 import math
 import random
@@ -13,17 +13,17 @@ from pathlib import Path
 
 @dataclass
 class Case:
-    """行列の入力と、検証する数値条件を保持する。
+    """検証用の入力行列と計算条件をまとめたデータ。
 
     Attributes:
-        name: 検証する条件の名称。
-        m: 出力の行数。
-        n: 出力の列数。
-        k: 内積の項数。
-        a: 行優先の入力A。
-        b: 行優先の入力B。
-        batch: 一度に処理する行数。
-        fused: 指数調整後もCRTの範囲を超えるか非有限値を含み、各積和演算で丸める入力。
+        name: テストケースの名前。
+        m: 出力行列Cの行数。
+        n: 出力行列Cの列数。
+        k: 内積の項数（Aの列数およびBの行数）。
+        a: 行優先で並べた入力行列Aの要素。
+        b: 行優先で並べた入力行列Bの要素。
+        batch: 1回のバッチで処理するCの行数。
+        fused: CRTの表現範囲を超えるか非有限値を含むため、FMAの逐次丸めで期待値を求める場合はTrue。
     """
 
     name: str
@@ -37,13 +37,13 @@ class Case:
 
 
 def round_fraction(value):
-    """厳密な有理数をFP64へ最近接偶数丸めする。
+    """有理数を最近接偶数丸めで倍精度浮動小数点数（FP64）に変換する。
 
     Args:
-        value: 丸める値。
+        value: 丸める対象の有理数。
 
     Returns:
-        丸めた値。表現範囲を超える場合は符号に従う無限大。
+        FP64に丸めた値。表現可能な範囲を超える場合は符号に応じた無限大を返す。
     """
     try:
         return float(value)
@@ -52,15 +52,15 @@ def round_fraction(value):
 
 
 def fused_result(a, b, c):
-    """浮動小数点の乗算を使わず、積和演算の期待値を求める。
+    """浮動小数点の乗算を使わずに、積和演算 fma(a, b, c) の期待値を求める。
 
     Args:
-        a: 第一の乗数。
-        b: 第二の乗数。
+        a: 第1の乗数。
+        b: 第2の乗数。
         c: 加数。
 
     Returns:
-        厳密な積と加数の和を一回だけ丸めた値。
+        厳密な積 a * b と加数 c の和を1回だけ最近接偶数丸めした値。
     """
     if any(math.isnan(value) for value in (a, b, c)):
         return math.nan
@@ -78,13 +78,13 @@ def fused_result(a, b, c):
 
 
 def exact_result(case):
-    """定義された内積の丸め方で、期待値の全ビットを求める。
+    """仕様で定めた内積の丸め規則に従って、出力行列の期待値のバイト列を求める。
 
     Args:
-        case: 検証する入力。
+        case: 検証するテストケース。
 
     Returns:
-        FP64の期待値のビット列。
+        出力行列の各要素をリトルエンディアンのFP64で表したバイト列。
     """
     output = bytearray()
     for i in range(case.m):
@@ -102,10 +102,10 @@ def exact_result(case):
 
 
 def matrix_cases():
-    """数値的な意味と処理が変わる境界について、入力を作成する。
+    """丸め境界や計算経路が切り替わる条件を網羅したテストケースを作成する。
 
     Returns:
-        検証する入力の列。
+        検証するテストケースのリスト。
     """
     tiny = 2.0**-1074
     minimum = 2.0**-1022
@@ -192,12 +192,12 @@ def matrix_cases():
 
 
 def run_case(executable, directory, case):
-    """公開コマンドの出力を、独立した期待値の全ビットと比較する。
+    """コマンドラインツールの出力と、独立して求めた期待値の全ビットが一致するかを検証する。
 
     Args:
-        executable: ビルド済みコマンド。
-        directory: 一時ファイルの格納先。
-        case: 検証する入力。
+        executable: ビルド済みの実行ファイルのパス。
+        directory: 入出力用の一時ファイルを置くディレクトリー。
+        case: 検証するテストケース。
     """
     a_path, b_path, c_path = (directory / name for name in ("a.bin", "b.bin", "c.bin"))
     a_path.write_bytes(struct.pack(f"<{len(case.a)}d", *case.a))
@@ -218,11 +218,11 @@ def run_case(executable, directory, case):
 
 
 def rejected_inputs(executable, directory):
-    """入力境界で定義された拒否動作を確認する。
+    """不正な入力が仕様どおりに拒否されることを確認する。
 
     Args:
-        executable: ビルド済みコマンド。
-        directory: 一時ファイルの格納先。
+        executable: ビルド済みの実行ファイルのパス。
+        directory: 入出力用の一時ファイルを置くディレクトリー。
     """
     a_path, b_path, c_path = (directory / name for name in ("a.bin", "b.bin", "c.bin"))
     for name, a_bytes, batch in [
@@ -240,7 +240,7 @@ def rejected_inputs(executable, directory):
 
 
 def main():
-    """一時ディレクトリーで数値検証と入力境界の検証を実行する。"""
+    """一時ディレクトリーを作成し、数値精度の検証と不正入力の拒否テストを実行する。"""
     executable = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory() as directory:
         for case in matrix_cases():

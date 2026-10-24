@@ -1,4 +1,4 @@
-"""外部のCとC++のプロジェクトから、組み込みと配布されたライブラリーを検証する。"""
+"""外部のCおよびC++プロジェクトから、ソース組み込みとパッケージ導入の両方でライブラリーを利用できるか検証する。"""
 
 import subprocess
 import sys
@@ -7,10 +7,10 @@ from pathlib import Path
 
 
 def run(arguments: list[str]) -> None:
-    """構成、ビルドまたは実行の失敗を、そのコマンドの出力とともに報告する。
+    """コマンドを実行し、失敗したときは標準出力と標準エラー出力を表示して例外を送出する。
 
     Args:
-        arguments: 実行するコマンドと引数。
+        arguments: 実行するコマンドとその引数のリスト。
     """
     completed = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
     if completed.returncode != 0:
@@ -20,7 +20,7 @@ def run(arguments: list[str]) -> None:
 
 
 def main() -> None:
-    """CとC++だけを有効にしたプロジェクトで、ライブラリーの導入と行列積を検証する。"""
+    """CまたはC++のみを有効にした外部プロジェクトを構成し、ライブラリーのリンクと行列積の実行を確認する。"""
     cmake, ctest, source_name, build_name, configuration, generator = sys.argv[1:]
     source = Path(source_name)
     build = Path(build_name)
